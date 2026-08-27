@@ -17,3 +17,6 @@ subprojects/
 
 # Local Bangla documentation (kept out of version control)
 docBng/
+
+# Runtime history log
+logs/

@@ -11,6 +11,7 @@ from gi.repository import GObject, GLib, Gio, Gtk, Adw  # noqa: E402
 
 from .detection import TexInstallation, detect  # noqa: E402
 from .dialogs import show_confirm  # noqa: E402
+from .history import log_event  # noqa: E402
 from .models import PackageItem, TemplateItem  # noqa: E402
 
 _SAFE_TUG_PREFIXES = ("/usr/local/texlive", "/opt/texlive",
@@ -359,6 +360,15 @@ class MainWindow(Adw.ApplicationWindow):
         path.add(path_row)
         vbox.append(path)
 
+        history = Adw.PreferencesGroup(title="History Log")
+        history_row = Adw.ActionRow(title="Installation history",
+                                    subtitle="Commands run by TeXManager")
+        history_btn = Gtk.Button(label="View")
+        history_btn.connect("clicked", self.on_view_history)
+        history_row.add_suffix(history_btn)
+        history.add(history_row)
+        vbox.append(history)
+
         clamp.set_child(vbox)
         stack.add_titled(clamp, "utilities", "Utilities").set_icon_name(
             "preferences-system-symbolic")
@@ -404,6 +414,10 @@ class MainWindow(Adw.ApplicationWindow):
             self.conflict_banner.set_revealed(False)
         self.status_icon.set_from_icon_name("emblem-ok-symbolic")
         self.status_icon.set_css_classes(["success"])
+        log_event("_refresh_installation_status",
+                  f"installs={len(self._installations)} "
+                  f"primary={self._primary.label if self._primary else 'none'} "
+                  f"conflict={self.conflict_banner.get_revealed()}")
 
     def on_show_details(self, *args):
         dialog = Adw.Dialog()
@@ -445,6 +459,15 @@ class MainWindow(Adw.ApplicationWindow):
             else:
                 tag = "Active"
             row = Adw.ExpanderRow(title=inst.label, subtitle=tag)
+            if multi:
+                uninstall_btn = Gtk.Button(
+                    label="Uninstall",
+                    css_classes=["destructive-action"],
+                    tooltip_text=f"Uninstall {inst.label}")
+                uninstall_btn.connect(
+                    "clicked",
+                    lambda *_b, i=inst: self._confirm_uninstall(i, dialog))
+                row.add_suffix(uninstall_btn)
             row.add_row(Adw.ActionRow(title="Root", subtitle=inst.root))
             row.add_row(Adw.ActionRow(title="Bin directory",
                                      subtitle=inst.bin_dir))
@@ -503,6 +526,65 @@ class MainWindow(Adw.ApplicationWindow):
             "Consider removing the older/duplicate installs so a single TeX Live "
             "owns your PATH, then re-run detection.")
         return " ".join(parts)
+
+    # ---- uninstall (conflict cleanup) ----
+    def _confirm_uninstall(self, inst, details_dialog):
+        if inst.source == "distro" or inst.root == "/usr":
+            detail = ("This will run: pkexec apt-get remove --purge -y "
+                      "'texlive-*' to uninstall the distro (apt) TeX Live.")
+        else:
+            detail = (f"This will remove the directory via: "
+                      f"pkexec rm -rf {inst.root}")
+        show_confirm(
+            self,
+            "Uninstall installation?",
+            f"Uninstall {inst.label}?",
+            [detail, "This action cannot be undone."],
+            lambda: self._uninstall_installation(inst, details_dialog),
+        )
+
+    def _uninstall_installation(self, inst, details_dialog):
+        details_dialog.close()
+        try:
+            if inst.source == "distro" or inst.root == "/usr":
+                cmd = ["pkexec", "apt-get", "remove", "--purge", "-y",
+                       "texlive-*"]
+            else:
+                if not inst.root.startswith(_SAFE_TUG_PREFIXES):
+                    raise RuntimeError(
+                        f"Refusing to uninstall unsafe path: {inst.root}")
+                cmd = ["pkexec", "rm", "-rf", inst.root]
+            if shutil.which("pkexec") is None:
+                cmd = cmd[1:]
+            cmd_str = " ".join(cmd)
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=300)
+            rc = result.returncode
+            log_event("_uninstall_installation", cmd_str,
+                      f"returncode={rc}; "
+                      f"stdout={result.stdout[:500]}; "
+                      f"stderr={result.stderr[:500]}")
+            if rc != 0:
+                raise RuntimeError(result.stderr or result.stdout
+                                  or "Uninstall command failed")
+        except Exception as exc:
+            log_event("_uninstall_installation", str(inst.label),
+                      f"ERROR: {exc}")
+            self._show_uninstall_result(False, str(exc), inst)
+            return
+        self._refresh_installation_status()
+        self._show_uninstall_result(True, "", inst)
+
+    def _show_uninstall_result(self, success, error, inst):
+        dialog = Adw.AlertDialog(
+            heading="Uninstall " + ("complete" if success else "failed"),
+            body=(f"{inst.label} was uninstalled."
+                  if success else
+                  f"Could not uninstall {inst.label}:\n{error}"),
+        )
+        dialog.add_response("ok", "OK")
+        dialog.set_default_response("ok")
+        dialog.present(self)
 
     # ---- handlers (UI only; backend TODO) ----
     def on_resolve_conflict(self, *args):  # A.3
@@ -619,3 +701,27 @@ class MainWindow(Adw.ApplicationWindow):
 
     def on_scan_symlinks(self, *args):  # E.3
         pass
+
+    def on_view_history(self, *args):
+        from .history import read_history
+        text = read_history() or "(no history yet)"
+        dialog = Adw.Dialog()
+        dialog.set_title("Installation History")
+        dialog.set_content_width(640)
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda *_: dialog.close())
+        header.pack_end(close)
+        toolbar.add_top_bar(header)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True, min_content_height=360,
+                                    max_content_height=600)
+        view = Gtk.TextView(editable=False, monospace=True,
+                            css_classes=["terminal"])
+        view.get_buffer().set_text(text)
+        scroll.set_child(view)
+        toolbar.set_content(scroll)
+        dialog.set_child(toolbar)
+        dialog.present(self)
