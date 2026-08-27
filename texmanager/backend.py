@@ -5,6 +5,7 @@ never touch GTK and only shell out to ``tlmgr`` or read the local TLPDB file.
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -76,3 +77,85 @@ def _find_tlpdb() -> Path | None:
         return None
     # Prefer the lexicographically-last (newest) TLPDB on disk.
     return sorted(candidates)[-1]
+
+
+def texmf_dist_dir() -> str | None:
+    """Return the TEXMFDIST root (where installed package files live)."""
+    kpse = shutil.which("kpsewhich")
+    if kpse:
+        try:
+            out = subprocess.run([kpse, "-var-value", "TEXMFDIST"],
+                                 capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                val = out.stdout.strip()
+                if val:
+                    return val
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def package_details(name: str, tlmgr: str | None = None) -> dict:
+    """Return metadata + installed file paths for a single package.
+
+    Keys: name, category, shortdesc, longdesc, revision, installed, files
+    (list of absolute file paths).
+    """
+    tlmgr = tlmgr or find_tlmgr()
+    info: dict = {"name": name, "installed": True, "files": []}
+    if tlmgr:
+        try:
+            out = subprocess.run([tlmgr, "info", "--list", name],
+                                 capture_output=True, text=True, timeout=60)
+            if out.returncode == 0:
+                _parse_tlmgr_info(out.stdout, info)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return info
+
+
+def _parse_tlmgr_info(text: str, info: dict) -> None:
+    texmf = texmf_dist_dir()
+    in_files = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("package:"):
+            info["name"] = s.split(":", 1)[1].strip()
+        elif s.startswith("category:"):
+            info["category"] = s.split(":", 1)[1].strip()
+        elif s.startswith("shortdesc:"):
+            info["shortdesc"] = s.split(":", 1)[1].strip()
+        elif s.startswith("longdesc:"):
+            info["longdesc"] = s.split(":", 1)[1].strip()
+        elif s.startswith("installed:"):
+            info["installed"] = s.split(":", 1)[1].strip().lower() == "yes"
+        elif s.startswith("revision:"):
+            info["revision"] = s.split(":", 1)[1].strip()
+        elif s in ("files:",) or s.lower() in (
+                "run files:", "doc files:", "source files:", "bin files:"):
+            in_files = True
+        elif in_files and s:
+            path = s
+            if texmf and path.startswith("texmf-dist/"):
+                path = texmf + "/" + path[len("texmf-dist/"):]
+            info["files"].append(path)
+
+
+def uninstall_package(name: str, tlmgr: str | None = None) -> str:
+    """Remove an installed package via ``tlmgr remove``.
+
+    Uses ``pkexec`` automatically when the install root is not writable by the
+    current user (system-wide TeX Live). Raises ``RuntimeError`` on failure.
+    """
+    tlmgr = tlmgr or find_tlmgr()
+    if not tlmgr:
+        raise RuntimeError("tlmgr not found; cannot uninstall packages")
+    root = os.path.dirname(os.path.dirname(os.path.dirname(tlmgr)))
+    cmd = [tlmgr, "remove", "--force", name]
+    if not os.access(root, os.W_OK) and shutil.which("pkexec"):
+        cmd = ["pkexec"] + cmd
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip()
+                           or "tlmgr remove failed")
+    return result.stdout

@@ -3,12 +3,13 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
+import os
 import shutil
 import subprocess
 import threading
 from pathlib import Path
 
-from gi.repository import GObject, GLib, Gio, Gtk, Adw  # noqa: E402
+from gi.repository import GObject, GLib, Gio, Gtk, Adw, Pango, Gdk  # noqa: E402
 
 from . import backend  # noqa: E402
 from .detection import TexInstallation, detect  # noqa: E402
@@ -19,26 +20,6 @@ from .models import PackageItem, TemplateItem  # noqa: E402
 _SAFE_TUG_PREFIXES = ("/usr/local/texlive", "/opt/texlive",
                      str(Path.home() / "texlive"))
 
-
-PACKAGE_ROW_FACTORY = b"""
-<interface>
-  <template class="GtkListItem">
-    <property name="child">
-      <object class="GtkLabel">
-        <property name="xalign">0</property>
-        <property name="hexpand">1</property>
-        <property name="margin-start">12</property>
-        <property name="margin-end">12</property>
-        <binding name="label">
-          <lookup name="name" type="PackageItem">
-            <lookup name="item">GtkListItem</lookup>
-          </lookup>
-        </binding>
-      </object>
-    </property>
-  </template>
-</interface>
-"""
 
 TEMPLATE_CARD_FACTORY = b"""
 <interface>
@@ -90,19 +71,18 @@ TEMPLATE_CARD_FACTORY = b"""
 """
 
 
-def _list_factory(xml: bytes) -> Gtk.BuilderListItemFactory:
-    return Gtk.BuilderListItemFactory(bytes=GLib.Bytes(xml))
-
-
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.set_title("TeXManager")
         self.set_default_size(1000, 720)
 
+        self._apply_styles()
+
         self._primary: TexInstallation | None = None
         self._installations: list[TexInstallation] = []
         self._conflict_radios: list = []
+        self._selected_package: str | None = None
 
         self._build_ui()
         self._populate_packages()
@@ -130,6 +110,29 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     # ------------------------------------------------------------------ UI
+    def _apply_styles(self):
+        css = """
+        .package-row {
+            padding: 8px 6px;
+            border-radius: 10px;
+        }
+        .package-row:hover {
+            background-color: rgba(127, 127, 127, 0.12);
+        }
+        .package-name {
+            font-weight: 600;
+        }
+        .package-sub {
+            font-size: 0.85em;
+        }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_string(css)
+        display = Gdk.Display.get_default()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
     def _build_ui(self):
         toolbar = Adw.ToolbarView()
 
@@ -291,6 +294,9 @@ class MainWindow(Adw.ApplicationWindow):
         # content: list + bulk action bar
         list_toolbar = Adw.ToolbarView()
         cheader = Adw.HeaderBar()
+        # this header is the list page's title bar (not the window's): hide the
+        # min/max/close buttons so only the main window keeps them
+        cheader.set_show_end_title_buttons(False)
         self.packages_title = Gtk.Label(label="Installed",
                                          css_classes=["heading"])
         cheader.set_title_widget(self.packages_title)
@@ -311,9 +317,10 @@ class MainWindow(Adw.ApplicationWindow):
         scroll.set_min_content_height(200)
         scroll.set_min_content_width(300)
         scroll.set_size_request(400, 300)
-        self.packages_list = Gtk.ListView(factory=_list_factory(PACKAGE_ROW_FACTORY),
-                                          css_classes=[],
-                                          vexpand=True, hexpand=True)
+        self.packages_list = Gtk.ListView(
+            factory=self._build_package_list_factory(),
+            css_classes=[], vexpand=True, hexpand=True)
+        self.packages_list.set_show_separators(True)
         self.packages_list.set_size_request(400, 300)
         scroll.set_child(self.packages_list)
         list_toolbar.set_content(scroll)
@@ -339,11 +346,21 @@ class MainWindow(Adw.ApplicationWindow):
         # wire drawer selection
         drawer.connect("row-selected", self._on_drawer_row_selected)
 
+        # details page (pushed on double-click / Enter from the list)
+        self._details_page = self._build_details_panel()
+
+        # NavigationView: list page (root) <-> details page (with Back button)
+        self._nav = Adw.NavigationView()
+        list_page = Adw.NavigationPage(child=list_toolbar,
+                                       title="Packages", tag="list")
+        self._nav.push(list_page)
+        self.packages_list.connect("activate", self._on_package_activate)
+
         split.set_sidebar(Adw.NavigationPage(child=sidebar_box,
                                              title="Browse Packages",
                                              tag="drawer"))
         split.set_content(Adw.NavigationPage(
-            child=list_toolbar, title="Packages", tag="packages"))
+            child=self._nav, title="Packages", tag="packages"))
         stack.add_titled(split, "packages", "Packages").set_icon_name(
             "system-software-install-symbolic")
 
@@ -358,8 +375,246 @@ class MainWindow(Adw.ApplicationWindow):
             self._current_fmodel = self._updates_fmodel
         else:
             self._current_fmodel = self._categories_fmodel
-        self.packages_list.set_model(
-            Gtk.SingleSelection.new(self._current_fmodel))
+        self._set_package_model(self._current_fmodel)
+
+    def _build_package_list_factory(self) -> Gtk.SignalListItemFactory:
+        """Each row = package name (left) + an Uninstall button (right)."""
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self._pkg_row_setup)
+        factory.connect("bind", self._pkg_row_bind)
+        return factory
+
+    def _pkg_row_setup(self, factory, listitem):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row.set_css_classes(["package-row"])
+        row.set_margin_start(10)
+        row.set_margin_end(10)
+        row.set_margin_top(4)
+        row.set_margin_bottom(4)
+
+        icon = Gtk.Image(icon_name="package-x-generic-symbolic",
+                         pixel_size=28, valign=Gtk.Align.CENTER,
+                         css_classes=["dim-label"])
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        name = Gtk.Label(xalign=0, hexpand=True,
+                         ellipsize=Pango.EllipsizeMode.MIDDLE,
+                         css_classes=["package-name"])
+        sub = Gtk.Label(xalign=0, css_classes=["package-sub", "dim-label"],
+                        ellipsize=Pango.EllipsizeMode.MIDDLE)
+        vbox.append(name)
+        vbox.append(sub)
+
+        btn = Gtk.Button(icon_name="user-trash-symbolic",
+                         css_classes=["destructive-action", "flat"],
+                         tooltip_text="Uninstall this package",
+                         valign=Gtk.Align.CENTER)
+
+        row.append(icon)
+        row.append(vbox)
+        row.append(btn)
+        listitem.set_child(row)
+        listitem._pkg_name = name
+        listitem._pkg_sub = sub
+        listitem._pkg_btn = btn
+        btn.connect("clicked", lambda *_: self._on_row_uninstall_clicked(listitem))
+
+    def _pkg_row_bind(self, factory, listitem):
+        item = listitem.get_item()
+        if item is None:
+            return
+        listitem._pkg_name.set_label(item.name)
+        listitem._pkg_sub.set_label(item.category or "")
+        listitem._pkg_btn.set_visible(item.installed)
+        listitem._pkg_btn.set_sensitive(item.installed)
+
+    def _on_row_uninstall_clicked(self, listitem):
+        item = listitem.get_item()
+        if item is None:
+            return
+        self._confirm_uninstall_package(item.name)
+
+    def _confirm_uninstall_package(self, name):
+        show_confirm(
+            self, "Uninstall package?",
+            f"Uninstall {name}?",
+            [f"This removes {name} from TeX Live via tlmgr. "
+             "This action cannot be undone."],
+            lambda: self._uninstall_package(name),
+        )
+
+    def _set_package_model(self, fmodel):
+        """Wrap a filter model in a SingleSelection and track selection."""
+        sel = Gtk.SingleSelection.new(fmodel)
+        sel.set_autoselect(False)
+        sel.connect("selection-changed", self._on_package_selection_changed)
+        self.packages_list.set_model(sel)
+
+    def _on_package_selection_changed(self, selection, position, n_items):
+        # single click just tracks the current row; details open on activate
+        item = selection.get_selected_item()
+        self._selected_package = item.name if item is not None else None
+
+    def _on_package_activate(self, listview, position):
+        """Double-click / Enter on a row pushes the details page."""
+        model = listview.get_model()
+        item = model.get_item(position)
+        if item is None:
+            return
+        self._push_package_details(item.name)
+
+    def _build_details_panel(self):
+        page = Adw.NavigationPage()
+        page.set_title("Package details")
+        page.set_tag("details")
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        # this header is the details page's title bar, not the window's:
+        # hide the min/max/close buttons and keep only the nav Back button
+        header.set_show_end_title_buttons(False)
+        self._details_title = Gtk.Label(label="", css_classes=["heading"])
+        header.set_title_widget(self._details_title)
+
+        self._details_spinner = Gtk.Spinner()
+        header.pack_end(self._details_spinner)
+
+        self._details_uninstall = Gtk.Button(icon_name="user-trash-symbolic",
+                                             css_classes=["destructive-action"],
+                                             tooltip_text="Uninstall this package")
+        self._details_uninstall.connect("clicked", self._on_details_uninstall)
+        header.pack_end(self._details_uninstall)
+        toolbar.add_top_bar(header)
+
+        clamp = Adw.Clamp(maximum_size=620, margin_top=12, margin_bottom=12)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+
+        self._details_desc = Gtk.Label(label="", xalign=0, wrap=True,
+                                       selectable=True,
+                                       css_classes=["dim-label"])
+        vbox.append(self._details_desc)
+
+        meta = Adw.PreferencesGroup(title="Information")
+        self._details_cat_row = Adw.ActionRow(title="Category",
+                                              subtitle="—")
+        self._details_rev_row = Adw.ActionRow(title="Revision",
+                                              subtitle="—")
+        self._details_path_row = Adw.ActionRow(title="Installed at",
+                                               subtitle="—")
+        meta.add(self._details_cat_row)
+        meta.add(self._details_rev_row)
+        meta.add(self._details_path_row)
+        vbox.append(meta)
+
+        files_group = Adw.PreferencesGroup(title="Installed files")
+        self._details_files_view = Gtk.TextView(editable=False, monospace=True,
+                                                css_classes=["terminal"])
+        scroll = Gtk.ScrolledWindow(min_content_height=160, vexpand=True)
+        scroll.set_child(self._details_files_view)
+        files_group.add(scroll)
+        vbox.append(files_group)
+
+        clamp.set_child(vbox)
+        toolbar.set_content(clamp)
+        page.set_child(toolbar)
+        return page
+
+    def _push_package_details(self, name):
+        """Push the details page (with an automatic Back button)."""
+        self._selected_package = name
+        self._details_title.set_label(name)
+        self._details_spinner.start()
+        self._details_uninstall.set_sensitive(False)
+        if self._nav.get_visible_page() is not self._details_page:
+            self._nav.push(self._details_page)
+
+        def worker():
+            info = backend.package_details(name)
+            GLib.idle_add(self._finish_package_details, info)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_package_details(self, info):
+        self._details_spinner.stop()
+        self._details_uninstall.set_sensitive(True)
+        self._details_desc.set_label(
+            info.get("shortdesc") or info.get("longdesc") or "")
+        self._details_cat_row.set_subtitle(info.get("category", "—"))
+        self._details_rev_row.set_subtitle(str(info.get("revision", "—")))
+        files = info.get("files", [])
+        if files:
+            try:
+                base = (os.path.commonpath(files)
+                        if len(files) > 1 else os.path.dirname(files[0]))
+            except ValueError:
+                base = "—"
+            self._details_path_row.set_subtitle(base)
+            self._details_files_view.get_buffer().set_text("\n".join(files))
+        else:
+            self._details_path_row.set_subtitle("—")
+            self._details_files_view.get_buffer().set_text("(no file list)")
+        return False
+
+    def _on_details_uninstall(self, *args):
+        name = self._selected_package
+        if not name:
+            return
+        show_confirm(
+            self, "Uninstall package?",
+            f"Uninstall {name}?",
+            [f"This removes {name} from TeX Live via tlmgr. "
+             "This action cannot be undone."],
+            lambda: self._uninstall_package(name),
+        )
+
+    def _uninstall_package(self, name):
+        processing = Adw.AlertDialog(heading="Uninstalling…",
+                                     body=f"Removing {name}…")
+        spinner = Gtk.Spinner(spinning=True)
+        spinner.set_margin_top(12)
+        processing.set_extra_child(spinner)
+        processing.present(self)
+
+        def worker():
+            error = None
+            try:
+                backend.uninstall_package(name)
+            except Exception as exc:
+                error = str(exc)
+            log_event("_uninstall_package", name,
+                      "ok" if error is None else f"ERROR: {error}")
+            GLib.idle_add(self._finish_uninstall_package, name, processing, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_uninstall_package(self, name, processing, error):
+        processing.close()
+        if error:
+            dialog = Adw.AlertDialog(heading="Uninstall failed", body=error)
+        else:
+            # remove the package from every store that contains it
+            for store in (self._installed_store, self._updates_store,
+                          self._categories_store):
+                for i in range(store.get_n_items()):
+                    if store.get_item(i).name == name:
+                        store.remove(i)
+                        break
+            # return to the list view if the details page is open
+            if self._nav.get_visible_page() is self._details_page:
+                self._nav.pop()
+            self._selected_package = None
+            self._details_title.set_label("")
+            self._details_desc.set_label("")
+            self._details_cat_row.set_subtitle("—")
+            self._details_rev_row.set_subtitle("—")
+            self._details_path_row.set_subtitle("—")
+            self._details_files_view.get_buffer().set_text("")
+            dialog = Adw.AlertDialog(heading="Uninstalled",
+                                     body=f"{name} was removed.")
+        dialog.add_response("ok", "OK")
+        dialog.set_default_response("ok")
+        dialog.present(self)
+        return False
 
     def _on_package_search(self, entry):
         self._name_filter.set_search(entry.get_text())
@@ -501,8 +756,7 @@ class MainWindow(Adw.ApplicationWindow):
                                                        category=category))
 
         # the Installed view is filled from the real TeX Live install
-        self.packages_list.set_model(
-            Gtk.SingleSelection.new(self._installed_fmodel))
+        self._set_package_model(self._installed_fmodel)
         self._load_installed_packages()
 
     def _load_installed_packages(self):
