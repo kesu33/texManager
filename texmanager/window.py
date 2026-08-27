@@ -5,6 +5,7 @@ gi.require_version("Adw", "1")
 
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 from gi.repository import GObject, GLib, Gio, Gtk, Adw  # noqa: E402
@@ -420,14 +421,15 @@ class MainWindow(Adw.ApplicationWindow):
                   f"conflict={self.conflict_banner.get_revealed()}")
 
     def on_show_details(self, *args):
-        dialog = Adw.Dialog()
-        dialog.set_title("Installation Details")
-        dialog.set_content_width(520)
+        win = Gtk.Window(title="Installation Details")
+        win.set_transient_for(self)
+        win.set_default_size(560, 600)
+        win.set_resizable(True)
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
         close = Gtk.Button(label="Close")
-        close.connect("clicked", lambda *_: dialog.close())
+        close.connect("clicked", lambda *_: win.close())
         header.pack_end(close)
         toolbar.add_top_bar(header)
 
@@ -466,7 +468,7 @@ class MainWindow(Adw.ApplicationWindow):
                     tooltip_text=f"Uninstall {inst.label}")
                 uninstall_btn.connect(
                     "clicked",
-                    lambda *_b, i=inst: self._confirm_uninstall(i, dialog))
+                    lambda *_b, i=inst: self._confirm_uninstall(i, win))
                 row.add_suffix(uninstall_btn)
             row.add_row(Adw.ActionRow(title="Root", subtitle=inst.root))
             row.add_row(Adw.ActionRow(title="Bin directory",
@@ -490,8 +492,8 @@ class MainWindow(Adw.ApplicationWindow):
         scrolled.set_child(vbox)
         clamp.set_child(scrolled)
         toolbar.set_content(clamp)
-        dialog.set_child(toolbar)
-        dialog.present(self)
+        win.set_child(toolbar)
+        win.present()
 
     def _build_suggestion(self):
         installs = self._installations
@@ -536,7 +538,7 @@ class MainWindow(Adw.ApplicationWindow):
             detail = (f"This will remove the directory via: "
                       f"pkexec rm -rf {inst.root}")
         show_confirm(
-            self,
+            details_dialog,
             "Uninstall installation?",
             f"Uninstall {inst.label}?",
             [detail, "This action cannot be undone."],
@@ -545,35 +547,55 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _uninstall_installation(self, inst, details_dialog):
         details_dialog.close()
-        try:
-            if inst.source == "distro" or inst.root == "/usr":
-                cmd = ["pkexec", "apt-get", "remove", "--purge", "-y",
-                       "texlive-*"]
-            else:
-                if not inst.root.startswith(_SAFE_TUG_PREFIXES):
-                    raise RuntimeError(
-                        f"Refusing to uninstall unsafe path: {inst.root}")
-                cmd = ["pkexec", "rm", "-rf", inst.root]
-            if shutil.which("pkexec") is None:
-                cmd = cmd[1:]
-            cmd_str = " ".join(cmd)
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                    timeout=300)
-            rc = result.returncode
-            log_event("_uninstall_installation", cmd_str,
-                      f"returncode={rc}; "
-                      f"stdout={result.stdout[:500]}; "
-                      f"stderr={result.stderr[:500]}")
-            if rc != 0:
-                raise RuntimeError(result.stderr or result.stdout
-                                  or "Uninstall command failed")
-        except Exception as exc:
-            log_event("_uninstall_installation", str(inst.label),
-                      f"ERROR: {exc}")
-            self._show_uninstall_result(False, str(exc), inst)
-            return
+
+        processing = Adw.AlertDialog(heading="Uninstalling…",
+                                      body=f"Removing {inst.label}…")
+        spinner = Gtk.Spinner(spinning=True)
+        spinner.set_margin_top(12)
+        spinner.set_size_request(32, 32)
+        processing.set_extra_child(spinner)
+        processing.present(self)
+
+        def worker():
+            error = None
+            try:
+                if inst.source == "distro" or inst.root == "/usr":
+                    cmd = ["pkexec", "apt-get", "remove", "--purge", "-y",
+                           "texlive-*"]
+                else:
+                    if not inst.root.startswith(_SAFE_TUG_PREFIXES):
+                        raise RuntimeError(
+                            f"Refusing to uninstall unsafe path: {inst.root}")
+                    cmd = ["pkexec", "rm", "-rf", inst.root]
+                if shutil.which("pkexec") is None:
+                    cmd = cmd[1:]
+                cmd_str = " ".join(cmd)
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=300)
+                rc = result.returncode
+                log_event("_uninstall_installation", cmd_str,
+                          f"returncode={rc}; "
+                          f"stdout={result.stdout[:500]}; "
+                          f"stderr={result.stderr[:500]}")
+                if rc != 0:
+                    raise RuntimeError(result.stderr or result.stdout
+                                      or "Uninstall command failed")
+            except Exception as exc:
+                error = str(exc)
+                log_event("_uninstall_installation", str(inst.label),
+                          f"ERROR: {exc}")
+            GLib.idle_add(self._finish_uninstall, inst, processing, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_uninstall(self, inst, processing, error):
+        processing.close()
         self._refresh_installation_status()
-        self._show_uninstall_result(True, "", inst)
+        if error:
+            self._show_uninstall_result(False, error, inst)
+        else:
+            self._show_uninstall_result(True, "", inst)
+        return False
 
     def _show_uninstall_result(self, success, error, inst):
         dialog = Adw.AlertDialog(
@@ -705,23 +727,23 @@ class MainWindow(Adw.ApplicationWindow):
     def on_view_history(self, *args):
         from .history import read_history
         text = read_history() or "(no history yet)"
-        dialog = Adw.Dialog()
-        dialog.set_title("Installation History")
-        dialog.set_content_width(640)
+        win = Gtk.Window(title="Installation History")
+        win.set_transient_for(self)
+        win.set_default_size(640, 480)
+        win.set_resizable(True)
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
         close = Gtk.Button(label="Close")
-        close.connect("clicked", lambda *_: dialog.close())
+        close.connect("clicked", lambda *_: win.close())
         header.pack_end(close)
         toolbar.add_top_bar(header)
 
-        scroll = Gtk.ScrolledWindow(vexpand=True, min_content_height=360,
-                                    max_content_height=600)
+        scroll = Gtk.ScrolledWindow(vexpand=True)
         view = Gtk.TextView(editable=False, monospace=True,
                             css_classes=["terminal"])
         view.get_buffer().set_text(text)
         scroll.set_child(view)
         toolbar.set_content(scroll)
-        dialog.set_child(toolbar)
-        dialog.present(self)
+        win.set_child(toolbar)
+        win.present()
