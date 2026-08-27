@@ -10,6 +10,7 @@ from pathlib import Path
 
 from gi.repository import GObject, GLib, Gio, Gtk, Adw  # noqa: E402
 
+from . import backend  # noqa: E402
 from .detection import TexInstallation, detect  # noqa: E402
 from .dialogs import show_confirm  # noqa: E402
 from .history import log_event  # noqa: E402
@@ -22,25 +23,19 @@ _SAFE_TUG_PREFIXES = ("/usr/local/texlive", "/opt/texlive",
 PACKAGE_ROW_FACTORY = b"""
 <interface>
   <template class="GtkListItem">
-    <object class="GtkBox">
-      <property name="spacing">12</property>
-      <property name="margin-start">12</property>
-      <property name="margin-end">12</property>
-      <child>
-        <object class="GtkCheckButton" id="check"/>
-      </child>
-      <child>
-        <object class="GtkLabel">
-          <property name="xalign">0</property>
-          <property name="hexpand">1</property>
-          <binding name="label">
-            <lookup name="name" type="PackageItem">
-              <lookup name="item">GtkListItem</lookup>
-            </lookup>
-          </binding>
-        </object>
-      </child>
-    </object>
+    <property name="child">
+      <object class="GtkLabel">
+        <property name="xalign">0</property>
+        <property name="hexpand">1</property>
+        <property name="margin-start">12</property>
+        <property name="margin-end">12</property>
+        <binding name="label">
+          <lookup name="name" type="PackageItem">
+            <lookup name="item">GtkListItem</lookup>
+          </lookup>
+        </binding>
+      </object>
+    </property>
   </template>
 </interface>
 """
@@ -113,6 +108,26 @@ class MainWindow(Adw.ApplicationWindow):
         self._populate_packages()
         self._populate_shortcuts()
         self._refresh_installation_status()
+        GLib.timeout_add(500, self._debug_listview_state)
+        # select installed row after stores are populated
+        self._select_package_drawer_row("Installed")
+
+    def _debug_listview_state(self):
+        if hasattr(self, 'packages_list') and self.packages_list is not None:
+            model = self.packages_list.get_model()
+            n_items = model.get_n_items() if model else 0
+            print(f"DEBUG _debug_listview_state n_items={n_items}")
+            if n_items > 0:
+                item = model.get_item(0)
+                print(f"DEBUG first item name={item.name if item else 'None'}")
+            alloc = self.packages_list.get_allocation()
+            print(f"DEBUG listview allocation width={alloc.width} height={alloc.height}")
+            parent = self.packages_list.get_parent()
+            print(f"DEBUG listview parent={parent}")
+            if parent:
+                parent_alloc = parent.get_allocation()
+                print(f"DEBUG parent allocation width={parent_alloc.width} height={parent_alloc.height}")
+        return False
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -219,36 +234,87 @@ class MainWindow(Adw.ApplicationWindow):
     def _build_packages(self, stack):
         split = Adw.NavigationSplitView()
 
-        # sidebar: Explain panel
-        explain_status = Adw.StatusPage(icon_name="info-symbolic",
-                                        title="Explain This Package",
-                                        description="Select a single package "
-                                                    "to see details.")
-        explain_clamp = Adw.Clamp(maximum_size=420)
-        self.explain_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                                   spacing=12, visible=False)
-        self.explain_name = Gtk.Label(xalign=0)
-        self.explain_desc = Gtk.Label(xalign=0, wrap=True)
-        self.explain_deps = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                                    spacing=6)
-        self.explain_install = Gtk.Button(label="Install", halign=Gtk.Align.CENTER,
-                                          css_classes=["suggested-action"])
-        self.explain_install.connect("clicked", self.on_explain_install)
-        self.explain_box.append(self.explain_name)
-        self.explain_box.append(self.explain_desc)
-        self.explain_box.append(self.explain_deps)
-        self.explain_box.append(self.explain_install)
-        explain_clamp.set_child(self.explain_box)
-        explain_status.set_child(explain_clamp)
-        split.set_sidebar(Adw.NavigationPage(child=explain_status,
-                                             title="Package Details",
-                                             tag="explain"))
+        # sidebar: drawer with Installed / Updates / Categories
+        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        sidebar_header = Adw.HeaderBar()
+        sidebar_header.set_title_widget(Gtk.Label(label="Packages",
+                                                  css_classes=["heading"]))
+        sidebar_box.append(sidebar_header)
+
+        drawer = Gtk.ListBox(css_classes=["boxed-list"],
+                             selection_mode=Gtk.SelectionMode.SINGLE)
+        drawer.set_margin_top(6)
+        drawer.set_margin_bottom(6)
+        drawer.set_margin_start(6)
+        drawer.set_margin_end(6)
+
+        installed_row = Adw.ActionRow(title="Installed",
+                                      subtitle="Packages on this system")
+        installed_row.set_icon_name("system-software-install-symbolic")
+        updates_row = Adw.ActionRow(title="Updates",
+                                    subtitle="Packages with updates available")
+        updates_row.set_icon_name("software-update-available-symbolic")
+        categories_row = Adw.ActionRow(title="Categories",
+                                       subtitle="Available packages by category")
+        categories_row.set_icon_name("view-grid-symbolic")
+
+        self._drawer_installed_row = installed_row
+        self._drawer_updates_row = updates_row
+        self._drawer_categories_row = categories_row
+        self._package_drawer = drawer
+
+        drawer.append(installed_row)
+        drawer.append(updates_row)
+        drawer.append(categories_row)
+        sidebar_box.append(drawer)
+
+        # stores for each view
+        self._installed_store = Gio.ListStore.new(PackageItem)
+        self._updates_store = Gio.ListStore.new(PackageItem)
+        self._categories_store = Gio.ListStore.new(PackageItem)
+
+        # a shared substring filter lets the search entry narrow any view
+        self._name_filter = Gtk.StringFilter(
+            match_mode=Gtk.StringFilterMatchMode.SUBSTRING)
+        self._name_filter.set_expression(
+            Gtk.PropertyExpression.new(PackageItem, None, "name"))
+        self._installed_fmodel = Gtk.FilterListModel(
+            model=self._installed_store, filter=self._name_filter)
+        self._updates_fmodel = Gtk.FilterListModel(
+            model=self._updates_store, filter=self._name_filter)
+        self._categories_fmodel = Gtk.FilterListModel(
+            model=self._categories_store, filter=self._name_filter)
+
+        # default to installed
+        self._current_fmodel = self._installed_fmodel
 
         # content: list + bulk action bar
         list_toolbar = Adw.ToolbarView()
-        scroll = Gtk.ScrolledWindow(vexpand=True)
+        cheader = Adw.HeaderBar()
+        self.packages_title = Gtk.Label(label="Installed",
+                                         css_classes=["heading"])
+        cheader.set_title_widget(self.packages_title)
+
+        self._packages_spinner = Gtk.Spinner()
+        self._packages_status = Gtk.Label(label="",
+                                           css_classes=["dim-label"])
+        search = Gtk.SearchEntry(placeholder_text="Filter packages…",
+                                 halign=Gtk.Align.END, width_request=220,
+                                 tooltip_text="Filter the package list by name")
+        search.connect("search-changed", self._on_package_search)
+        cheader.pack_end(search)
+        cheader.pack_end(self._packages_status)
+        cheader.pack_end(self._packages_spinner)
+        list_toolbar.add_top_bar(cheader)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+        scroll.set_min_content_height(200)
+        scroll.set_min_content_width(300)
+        scroll.set_size_request(400, 300)
         self.packages_list = Gtk.ListView(factory=_list_factory(PACKAGE_ROW_FACTORY),
-                                          css_classes=["boxed-list"])
+                                          css_classes=[],
+                                          vexpand=True, hexpand=True)
+        self.packages_list.set_size_request(400, 300)
         scroll.set_child(self.packages_list)
         list_toolbar.set_content(scroll)
 
@@ -270,10 +336,45 @@ class MainWindow(Adw.ApplicationWindow):
         self.selection_bar.pack_start(sel_box)
         list_toolbar.add_bottom_bar(self.selection_bar)
 
+        # wire drawer selection
+        drawer.connect("row-selected", self._on_drawer_row_selected)
+
+        split.set_sidebar(Adw.NavigationPage(child=sidebar_box,
+                                             title="Browse Packages",
+                                             tag="drawer"))
         split.set_content(Adw.NavigationPage(
             child=list_toolbar, title="Packages", tag="packages"))
         stack.add_titled(split, "packages", "Packages").set_icon_name(
             "system-software-install-symbolic")
+
+    def _on_drawer_row_selected(self, listbox, row):
+        if row is None:
+            return
+        title = row.get_title()
+        self.packages_title.set_label(title)
+        if title == "Installed":
+            self._current_fmodel = self._installed_fmodel
+        elif title == "Updates":
+            self._current_fmodel = self._updates_fmodel
+        else:
+            self._current_fmodel = self._categories_fmodel
+        self.packages_list.set_model(
+            Gtk.SingleSelection.new(self._current_fmodel))
+
+    def _on_package_search(self, entry):
+        self._name_filter.set_search(entry.get_text())
+
+    def _select_package_drawer_row(self, title):
+        row = None
+        if title == "Installed":
+            row = self._drawer_installed_row
+        elif title == "Updates":
+            row = self._drawer_updates_row
+        elif title == "Categories":
+            row = self._drawer_categories_row
+        print(f"DEBUG _select_package_drawer_row title={title!r} row={row}")
+        if row is not None and self._package_drawer is not None:
+            self._package_drawer.select_row(row)
 
     # ---- Tab 4: Compile & Watch (New Tab 4, A.1, A.2) ----
     def _build_compile_watch(self, stack):
@@ -374,12 +475,56 @@ class MainWindow(Adw.ApplicationWindow):
         stack.add_titled(clamp, "utilities", "Utilities").set_icon_name(
             "preferences-system-symbolic")
 
-    # ---- sample data ----
+    # ---- package data ----
     def _populate_packages(self):
-        store = Gio.ListStore.new(PackageItem)
-        for name in ("latex-base", "graphicx", "tikz", "biblatex", "fontspec"):
-            store.append(PackageItem(name))
-        self.packages_list.set_model(Gtk.NoSelection(model=store))
+        # updates available (sample)
+        for name, category in [
+            ("latex-base", "Core"),
+            ("graphicx", "Graphics"),
+            ("pgf", "Graphics"),
+        ]:
+            self._updates_store.append(PackageItem(name, installed=True,
+                                                   category=category))
+
+        # categories / available (sample)
+        for name, category in [
+            ("beamer", "Presentation"),
+            ("listings", "Source Code"),
+            ("hyperref", "Hyperlinks"),
+            ("geometry", "Page Layout"),
+            ("microtype", "Typography"),
+            ("siunitx", "Units"),
+            ("csquotes", "Quotations"),
+            ("booktabs", "Tables"),
+        ]:
+            self._categories_store.append(PackageItem(name, installed=False,
+                                                       category=category))
+
+        # the Installed view is filled from the real TeX Live install
+        self.packages_list.set_model(
+            Gtk.SingleSelection.new(self._installed_fmodel))
+        self._load_installed_packages()
+
+    def _load_installed_packages(self):
+        """Load the real installed packages off the UI thread."""
+        self._packages_spinner.start()
+        self._packages_status.set_label("Loading installed packages…")
+
+        def worker():
+            names = backend.list_installed_packages()
+            GLib.idle_add(self._finish_load_installed, names)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_load_installed(self, names):
+        self._installed_store.remove_all()
+        for name in names:
+            self._installed_store.append(PackageItem(name, installed=True,
+                                                     category="TeX Live"))
+        self._packages_spinner.stop()
+        self._packages_status.set_label(f"{len(names)} installed")
+        log_event("package-list", "installed", f"count={len(names)}")
+        return False
 
     def _populate_shortcuts(self):
         shortcuts = Gtk.ShortcutsWindow()

@@ -9,6 +9,7 @@ install_data(
     'dialogs.py',
     'models.py',
     'detection.py',
+    'backend.py',
   ],
   install_dir: join_paths(pythondir, 'texmanager'),
 )
