@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Meson build artifacts
+meson-private/
+subprojects/
+
+# Editor / OS
+*.swp
+*.swo
+.DS_Store
+
+# Local Bangla documentation (kept out of version control)
+docBng/

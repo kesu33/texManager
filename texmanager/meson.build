@@ -8,6 +8,7 @@ install_data(
     'window.py',
     'dialogs.py',
     'models.py',
+    'detection.py',
   ],
   install_dir: join_paths(pythondir, 'texmanager'),
 )

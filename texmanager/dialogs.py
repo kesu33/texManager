@@ -3,7 +3,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import GObject, GLib, Gtk, Adw  # noqa: E402
+from gi.repository import GObject, GLib, Gio, Gtk, Adw  # noqa: E402
 
 from .models import TemplateItem  # noqa: E402
 
@@ -125,7 +125,7 @@ class NewProjectDialog(Adw.Dialog):
         self.template_grid = Gtk.GridView(
             factory=_list_factory(TEMPLATE_CARD_FACTORY),
             max_columns=2, min_columns=2, vexpand=True)
-        store = GObject.ListStore.new(TemplateItem)
+        store = Gio.ListStore.new(TemplateItem)
         store.append(TemplateItem("Article", "Standard article with sections."))
         store.append(TemplateItem("Beamer", "Presentation slides."))
         store.append(TemplateItem("Thesis / Report", "Long-form book/report."))

@@ -3,9 +3,18 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
+import shutil
+import subprocess
+from pathlib import Path
+
 from gi.repository import GObject, GLib, Gio, Gtk, Adw  # noqa: E402
 
+from .detection import TexInstallation, detect  # noqa: E402
+from .dialogs import show_confirm  # noqa: E402
 from .models import PackageItem, TemplateItem  # noqa: E402
+
+_SAFE_TUG_PREFIXES = ("/usr/local/texlive", "/opt/texlive",
+                     str(Path.home() / "texlive"))
 
 
 PACKAGE_ROW_FACTORY = b"""
@@ -94,9 +103,14 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_title("TeXManager")
         self.set_default_size(1000, 720)
 
+        self._primary: TexInstallation | None = None
+        self._installations: list[TexInstallation] = []
+        self._conflict_radios: list = []
+
         self._build_ui()
         self._populate_packages()
         self._populate_shortcuts()
+        self._refresh_installation_status()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -150,12 +164,16 @@ class MainWindow(Adw.ApplicationWindow):
         vbox.append(self.conflict_banner)
 
         status_group = Adw.PreferencesGroup(title="Status")
-        status_row = Adw.ActionRow(title="TeX Installation",
-                                   subtitle="No installation detected")
-        status_icon = Gtk.Image(icon_name="dialog-warning-symbolic",
-                                css_classes=["warning"])
-        status_row.add_suffix(status_icon)
-        status_group.add(status_row)
+        self.status_row = Adw.ActionRow(title="TeX Installation",
+                                        subtitle="No installation detected")
+        self.status_icon = Gtk.Image(icon_name="dialog-warning-symbolic",
+                                     css_classes=["warning"])
+        self.status_row.add_suffix(self.status_icon)
+        self.details_btn = Gtk.Button(label="Details",
+                                      tooltip_text="Show installation details")
+        self.details_btn.connect("clicked", self.on_show_details)
+        self.status_row.add_suffix(self.details_btn)
+        status_group.add(self.status_row)
         vbox.append(status_group)
 
         history = Adw.ExpanderRow(title="History",
@@ -270,7 +288,7 @@ class MainWindow(Adw.ApplicationWindow):
         clamp.set_margin_bottom(12)
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
 
-        group = Adw.PreferencesGroup(title="Compile & Watch")
+        group = Adw.PreferencesGroup(title="Compile &amp; Watch")
         file_row = Adw.ActionRow(title="Root .tex file",
                                  subtitle="No file selected")
         browse = Gtk.Button(label="Browse…")
@@ -311,7 +329,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         clamp.set_child(vbox)
         toolbar.set_content(clamp)
-        stack.add_titled(toolbar, "compile", "Compile & Watch").set_icon_name(
+        stack.add_titled(toolbar, "compile", "Compile &amp; Watch").set_icon_name(
             "media-playback-start-symbolic")
 
     # ---- Utilities (E.2, E.3) ----
@@ -347,7 +365,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     # ---- sample data ----
     def _populate_packages(self):
-        store = GObject.ListStore.new(PackageItem)
+        store = Gio.ListStore.new(PackageItem)
         for name in ("latex-base", "graphicx", "tikz", "biblatex", "fontspec"):
             store.append(PackageItem(name))
         self.packages_list.set_model(Gtk.NoSelection(model=store))
@@ -359,15 +377,218 @@ class MainWindow(Adw.ApplicationWindow):
         quit_sc = Gtk.ShortcutsShortcut(title="Quit", action_name="app.quit")
         pref_sc = Gtk.ShortcutsShortcut(title="Preferences",
                                         action_name="app.preferences")
-        group.add(quit_sc)
-        group.add(pref_sc)
-        section.add(group)
-        shortcuts.add(section)
+        group.add_shortcut(quit_sc)
+        group.add_shortcut(pref_sc)
+        section.add_group(group)
+        shortcuts.add_section(section)
         self.set_help_overlay(shortcuts)
+
+    # ---- installation detection (backend) ----
+    def _refresh_installation_status(self):
+        self._primary, self._installations, conflict = detect()
+        if self._primary is None:
+            self.status_row.set_subtitle("No installation detected")
+            self.status_icon.set_from_icon_name("dialog-warning-symbolic")
+            self.status_icon.set_css_classes(["warning"])
+            self.conflict_banner.set_revealed(False)
+            return
+        if conflict:
+            n = len(self._installations)
+            self.status_row.set_subtitle(
+                f"{n} installations — using {self._primary.label}")
+            self.conflict_banner.set_title(
+                f"{n} TeX Live installations detected")
+            self.conflict_banner.set_revealed(True)
+        else:
+            self.status_row.set_subtitle(self._primary.label)
+            self.conflict_banner.set_revealed(False)
+        self.status_icon.set_from_icon_name("emblem-ok-symbolic")
+        self.status_icon.set_css_classes(["success"])
+
+    def on_show_details(self, *args):
+        dialog = Adw.Dialog()
+        dialog.set_title("Installation Details")
+        dialog.set_content_width(520)
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda *_: dialog.close())
+        header.pack_end(close)
+        toolbar.add_top_bar(header)
+
+        clamp = Adw.Clamp(margin_top=16, margin_bottom=16,
+                          margin_start=16, margin_end=16)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        suggestion = self._build_suggestion()
+        if suggestion:
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                           css_classes=["card"], margin_bottom=6)
+            card.set_margin_top(6)
+            card.set_margin_start(6)
+            card.set_margin_end(6)
+            card.append(Gtk.Label(label="Suggestion", xalign=0,
+                                  css_classes=["heading"]))
+            card.append(Gtk.Label(label=suggestion, xalign=0, wrap=True,
+                                  selectable=True))
+            vbox.append(card)
+        listbox = Gtk.ListBox(css_classes=["boxed-list"],
+                              selection_mode=Gtk.SelectionMode.NONE)
+        multi = len(self._installations) > 1
+        for inst in self._installations:
+            is_primary = (self._primary is not None
+                          and self._primary.bin_dir == inst.bin_dir)
+            if is_primary:
+                tag = "Primary"
+            elif multi:
+                tag = "Conflicting"
+            else:
+                tag = "Active"
+            row = Adw.ExpanderRow(title=inst.label, subtitle=tag)
+            row.add_row(Adw.ActionRow(title="Root", subtitle=inst.root))
+            row.add_row(Adw.ActionRow(title="Bin directory",
+                                     subtitle=inst.bin_dir))
+            row.add_row(Adw.ActionRow(
+                title="Year", subtitle=str(inst.year) if inst.year else "unknown"))
+            row.add_row(Adw.ActionRow(title="Source", subtitle=inst.source))
+            row.add_row(Adw.ActionRow(
+                title="tlmgr", subtitle="yes" if inst.has_tlmgr else "no"))
+            row.add_row(Adw.ActionRow(
+                title="Functional",
+                subtitle="yes" if inst.functional else "no (broken)"))
+            row.add_row(Adw.ActionRow(
+                title="Engines",
+                subtitle=", ".join(inst.engines) or "none"))
+            listbox.append(row)
+        vbox.append(listbox)
+        scrolled = Gtk.ScrolledWindow(vexpand=True,
+                                     min_content_height=320,
+                                     max_content_height=600)
+        scrolled.set_child(vbox)
+        clamp.set_child(scrolled)
+        toolbar.set_content(clamp)
+        dialog.set_child(toolbar)
+        dialog.present(self)
+
+    def _build_suggestion(self):
+        installs = self._installations
+        if not installs:
+            return ("No TeX installation was found. Install TeX Live to compile "
+                    "documents.")
+        if len(installs) == 1:
+            inst = installs[0]
+            if inst.functional:
+                return (f"You have a single, working installation "
+                        f"({inst.label}). No action needed.")
+            return (f"A TeX installation was found at {inst.root} but it is not "
+                    f"functional. Reinstall or repair it before compiling.")
+
+        rec = self._primary
+        others = [i for i in installs if i is not rec]
+        parts = []
+        if rec is not None:
+            parts.append(
+                f"Use {rec.label} as the primary (newest, tlmgr-managed, "
+                f"easiest to update).")
+        other_desc = ", ".join(o.label for o in others)
+        parts.append(
+            f"The other detected installation(s) — {other_desc} — share the same "
+            f"engines on your PATH and can cause format/package conflicts.")
+        if rec is not None and rec.has_tlmgr and any(not o.has_tlmgr for o in others):
+            parts.append(
+                "Avoid mixing tlmgr-managed and distro (apt) TeX Live: pick one "
+                "package manager. To keep the upstream install, remove the distro "
+                "one with: sudo apt remove 'texlive-*'.")
+        parts.append(
+            "Consider removing the older/duplicate installs so a single TeX Live "
+            "owns your PATH, then re-run detection.")
+        return " ".join(parts)
 
     # ---- handlers (UI only; backend TODO) ----
     def on_resolve_conflict(self, *args):  # A.3
+        if not self._installations:
+            self.conflict_banner.set_revealed(False)
+            return
+        n = len(self._installations)
+        alert = Adw.AlertDialog(
+            heading="Resolve installation conflict",
+            body=(
+                f"TeXManager detected {n} TeX installations on this machine. "
+                "Resolving lets you choose which one is used as the primary for "
+                "compiling and package management. The other installation(s) stay "
+                "on disk but will not be used by TeXManager. Continue?"
+            ),
+        )
+        alert.add_response("cancel", "Cancel")
+        alert.add_response("continue", "Continue")
+        alert.set_response_appearance(
+            "continue", Adw.ResponseAppearance.SUGGESTED)
+        alert.set_default_response("continue")
+        alert.set_close_response("cancel")
+        alert.connect(
+            "response",
+            lambda d, r: self._open_conflict_picker()
+            if r == "continue" else None)
+        alert.present(self)
+
+    def _open_conflict_picker(self):
+        dialog = Adw.Dialog()
+        dialog.set_title("Resolve Conflict")
+        dialog.set_content_width(460)
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        done = Gtk.Button(label="Use selected",
+                          css_classes=["suggested-action"])
+        header.pack_end(done)
+        toolbar.add_top_bar(header)
+
+        clamp = Adw.Clamp(margin_top=16, margin_bottom=16,
+                          margin_start=16, margin_end=16)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.append(Gtk.Label(
+            label=f"{len(self._installations)} TeX installations were found on "
+                  "this machine. TeXManager can only use one as primary. "
+                  "Select it below, then press “Use selected”.",
+            xalign=0, wrap=True))
+
+        listbox = Gtk.ListBox(css_classes=["boxed-list"],
+                              selection_mode=Gtk.SelectionMode.NONE)
+        self._conflict_radios = []
+        group = None
+        for inst in self._installations:
+            row = Adw.ActionRow(title=inst.label, subtitle=inst.bin_dir)
+            radio = Gtk.CheckButton()
+            if group is not None:
+                radio.set_group(group)
+            else:
+                group = radio
+            if self._primary is not None \
+                    and self._primary.bin_dir == inst.bin_dir:
+                radio.set_active(True)
+            row.add_prefix(radio)
+            listbox.append(row)
+            self._conflict_radios.append((radio, inst))
+        vbox.append(listbox)
+
+        scrolled = Gtk.ScrolledWindow(vexpand=True,
+                                     min_content_height=240,
+                                     max_content_height=480)
+        scrolled.set_child(vbox)
+        clamp.set_child(scrolled)
+        toolbar.set_content(clamp)
+        dialog.set_child(toolbar)
+        done.connect("clicked", lambda *_: self._apply_conflict_choice(dialog))
+        dialog.present(self)
+
+    def _apply_conflict_choice(self, dialog):
+        for radio, inst in self._conflict_radios:
+            if radio.get_active():
+                self._primary = inst
+                break
+        self._refresh_installation_status()
         self.conflict_banner.set_revealed(False)
+        dialog.close()
 
     def on_expand_report(self, *args):  # A.1
         pass
