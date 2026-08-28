@@ -5,6 +5,9 @@ gi.require_version("Adw", "1")
 
 from gi.repository import GObject, GLib, Gio, Gtk, Adw  # noqa: E402
 
+import threading
+
+from . import backend  # noqa: E402
 from .models import TemplateItem  # noqa: E402
 
 
@@ -93,6 +96,15 @@ class PreferencesWindow(Adw.PreferencesWindow):
                                         "or overwriting",
                                active=True)
         general_group.add(confirm)
+
+        appearance_group = Adw.PreferencesGroup(title="Appearance")
+        self.theme_selector = Adw.ComboRow(
+            title="Theme",
+            subtitle="Follow system preference",
+            model=Gtk.StringList.new(["System", "Light", "Dark"]))
+        self.theme_selector.connect("notify::selected", self.on_theme_changed)
+        appearance_group.add(self.theme_selector)
+        general_group.add(appearance_group)
         general_page.add(general_group)
         self.add(general_page)
 
@@ -101,6 +113,20 @@ class PreferencesWindow(Adw.PreferencesWindow):
 
     def on_interval_changed(self, *args):  # C.2
         pass
+
+    def on_theme_changed(self, *args):
+        selected = self.theme_selector.get_selected()
+        if selected is None or selected < 0:
+            return
+        model = self.theme_selector.get_model()
+        theme = model.get_string(selected)
+        style = Adw.StyleManager.get_default()
+        if theme == "Light":
+            style.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
+        elif theme == "Dark":
+            style.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        else:
+            style.set_color_scheme(Adw.ColorScheme.DEFAULT)
 
 
 class NewProjectDialog(Adw.Dialog):
@@ -181,10 +207,12 @@ class DependencyCheckDialog(Adw.AlertDialog):
 
 
 class OnboardingWindow(Adw.Window):
-    def __init__(self, **kwargs):
+    def __init__(self, year=None, **kwargs):
         super().__init__(**kwargs)
+        self._year = year
+        self._current_page = 0
         self.set_default_size(560, 620)
-        self.set_title("Set up TeXManager")
+        self.set_title(f"Install TeX Live {year}" if year else "Set up TeXManager")
         self.set_modal(True)
 
         toolbar = Adw.ToolbarView()
@@ -198,14 +226,17 @@ class OnboardingWindow(Adw.Window):
                           margin_start=16, margin_end=16)
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
 
-        carousel = Adw.Carousel(vexpand=True)
+        carousel = Adw.Carousel(hexpand=True, vexpand=True)
+        carousel.set_property("allow-mouse-drag", False)
+        carousel.set_property("allow-scroll-wheel", False)
         welcome = Adw.StatusPage(icon_name="system-software-install-symbolic",
                                  title="Welcome",
                                  description="Install and manage TeX Live on "
-                                             "this machine.")
+                                             "this machine.",
+                                 hexpand=True, vexpand=True)
         carousel.append(welcome)
 
-        scheme_page = Adw.PreferencesPage()
+        scheme_page = Adw.PreferencesPage(hexpand=True, vexpand=True)
         scheme_group = Adw.PreferencesGroup(title="Installation Scheme")
         self.scheme_picker = Adw.ComboRow(
             title="Scheme", subtitle="scheme-medium — approx. 1.8 GB",
@@ -214,6 +245,14 @@ class OnboardingWindow(Adw.Window):
                 "scheme-small", "scheme-medium", "scheme-full"]))
         self.scheme_picker.connect("notify::selected", self.on_scheme_changed)
         scheme_group.add(self.scheme_picker)
+        self.scheme_desc = Gtk.Label(
+            label="",
+            wrap=True,
+            xalign=0,
+            css_classes=["dim-label"],
+            margin_top=6,
+            margin_bottom=6)
+        scheme_group.add(self.scheme_desc)
         mirror_group = Adw.PreferencesGroup(title="Download Mirror")
         self.mirror_picker = Adw.ComboRow(title="Mirror",
                                           subtitle="Auto (nearest)",
@@ -228,7 +267,7 @@ class OnboardingWindow(Adw.Window):
         scheme_page.add(mirror_group)
         carousel.append(scheme_page)
 
-        progress_page = Adw.PreferencesPage()
+        progress_page = Adw.PreferencesPage(hexpand=True, vexpand=True)
         progress_group = Adw.PreferencesGroup(title="Install")
         self.install_progress = Gtk.ProgressBar(fraction=0.0, show_text=True,
                                                 text="Idle")
@@ -238,16 +277,19 @@ class OnboardingWindow(Adw.Window):
         progress_group.add(self.retry_status)
         progress_page.add(progress_group)
         carousel.append(progress_page)
+
+        self._carousel = carousel
+        self._pages = [welcome, scheme_page, progress_page]
         vbox.append(carousel)
 
         nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
                       halign=Gtk.Align.END)
-        back = Gtk.Button(label="Back")
-        back.connect("clicked", self.on_back)
-        next_btn = Gtk.Button(label="Next", css_classes=["suggested-action"])
-        next_btn.connect("clicked", self.on_next)
-        nav.append(back)
-        nav.append(next_btn)
+        self._back_btn = Gtk.Button(label="Back")
+        self._back_btn.connect("clicked", self.on_back)
+        self._next_btn = Gtk.Button(label="Next", css_classes=["suggested-action"])
+        self._next_btn.connect("clicked", self.on_next)
+        nav.append(self._back_btn)
+        nav.append(self._next_btn)
         vbox.append(nav)
 
         clamp.set_child(vbox)
@@ -258,16 +300,90 @@ class OnboardingWindow(Adw.Window):
         self.close()
 
     def on_scheme_changed(self, *args):  # B.1
-        pass
+        selected = self.scheme_picker.get_selected()
+        if selected is None or selected < 0:
+            return
+        model = self.scheme_picker.get_model()
+        scheme = model.get_string(selected)
+        sizes = {
+            "scheme-infraonly": "approx. 0.2 GB",
+            "scheme-basic": "approx. 0.5 GB",
+            "scheme-minimal": "approx. 0.7 GB",
+            "scheme-small": "approx. 1.0 GB",
+            "scheme-medium": "approx. 1.8 GB",
+            "scheme-full": "approx. 4.4 GB",
+        }
+        descs = {
+            "scheme-infraonly": "Essential infrastructure only — no extra packages or documentation.",
+            "scheme-basic": "Basic TeX and LaTeX with a small set of common packages.",
+            "scheme-minimal": "Minimal TeX/LaTeX setup, no additional packages.",
+            "scheme-small": "Small curated set of commonly used packages.",
+            "scheme-medium": "Medium package set suitable for typical documents.",
+            "scheme-full": "Complete TeX Live installation with all available packages.",
+        }
+        self.scheme_picker.set_subtitle(f"{scheme} — {sizes.get(scheme, 'unknown size')}")
+        self.scheme_desc.set_label(descs.get(scheme, ""))
 
     def on_refresh_mirror(self, *args):  # B.2
-        pass
+        self.mirror_picker.set_subtitle("Auto (nearest)")
 
     def on_back(self, *args):  # B.*
-        pass
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._carousel.scroll_to(self._pages[self._current_page], True)
 
     def on_next(self, *args):  # B.3
-        pass
+        if self._current_page == 0:
+            self._current_page += 1
+            self._carousel.scroll_to(self._pages[self._current_page], True)
+        elif self._current_page == 1:
+            self._start_install()
+        elif self._current_page == 2:
+            self.close()
+
+    def _start_install(self):
+        self._current_page += 1
+        self._carousel.scroll_to(self._pages[self._current_page], True)
+
+        self._back_btn.set_sensitive(False)
+        self._next_btn.set_sensitive(False)
+        self._next_btn.set_label("Installing…")
+
+        scheme_model = self.scheme_picker.get_model()
+        selected = self.scheme_picker.get_selected()
+        scheme = scheme_model.get_string(selected)
+
+        def worker():
+            try:
+                def progress(line):
+                    GLib.idle_add(self._on_install_progress, line)
+                backend.install_texlive(self._year, scheme, progress_callback=progress)
+                GLib.idle_add(self._on_install_complete, None)
+            except Exception as exc:
+                GLib.idle_add(self._on_install_complete, str(exc))
+
+        self._install_thread = threading.Thread(target=worker, daemon=True)
+        self._install_thread.start()
+        self.install_progress.set_fraction(0.0)
+        self.install_progress.set_text("Starting…")
+        self.retry_status.set_visible(False)
+
+    def _on_install_progress(self, line):
+        self.install_progress.set_text(line[:120])
+
+    def _on_install_complete(self, error):
+        self._back_btn.set_sensitive(True)
+        self._next_btn.set_sensitive(True)
+        if error:
+            self.install_progress.set_fraction(0.0)
+            self.install_progress.set_text("Failed")
+            self.retry_status.set_label(error[:300])
+            self.retry_status.set_visible(True)
+            self._next_btn.set_label("Close")
+        else:
+            self.install_progress.set_fraction(1.0)
+            self.install_progress.set_text("Installation complete")
+            self._next_btn.set_label("Close")
 
 
 def show_confirm(parent, title, summary, details, on_confirm):

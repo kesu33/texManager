@@ -10,6 +10,8 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -251,3 +253,75 @@ def fetch_available_texlive_years(timeout: int = 15) -> list[int]:
         years.append(years[0] - 1)
     years = sorted(set(years))
     return years
+
+
+def install_texlive(year: int, scheme: str, install_dir: str | None = None,
+                    progress_callback=None) -> str:
+    """Download and run the TeX Live network installer.
+
+    Streams installer output through *progress_callback* when provided.
+    Returns the complete installer output on success.
+    Raises ``RuntimeError`` on failure.
+    """
+    if install_dir is None:
+        install_dir = f"/usr/local/texlive/{year}"
+
+    url = "https://mirror.ctan.org/systems/texlive/tlnet/install-tl-unx.tar.gz"
+
+    with tempfile.TemporaryDirectory(prefix="texlive-installer-") as tmpdir:
+        tarball = os.path.join(tmpdir, "install-tl-unx.tar.gz")
+
+        req = urllib.request.Request(url, headers={"User-Agent": "TeXManager/1.0"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            with open(tarball, "wb") as f:
+                f.write(resp.read())
+
+        with tarfile.open(tarball, "r:gz") as tf:
+            tf.extractall(tmpdir)
+
+        install_script = None
+        for root, dirs, files in os.walk(tmpdir):
+            if "install-tl" in files:
+                install_script = os.path.join(root, "install-tl")
+                break
+
+        if not install_script:
+            raise RuntimeError("install-tl not found in downloaded archive")
+
+        os.chmod(install_script, 0o755)
+
+        cmd = [install_script, "-scheme", scheme, "-no-interaction",
+               "-texdir", install_dir]
+
+        if os.geteuid() != 0:
+            parent = os.path.dirname(install_dir)
+            needs_elev = False
+            if not os.path.exists(install_dir):
+                if not os.access(parent, os.W_OK):
+                    needs_elev = True
+            else:
+                if not os.access(install_dir, os.W_OK):
+                    needs_elev = True
+            if needs_elev:
+                for elev in ("pkexec", "sudo"):
+                    if shutil.which(elev):
+                        cmd = [elev] + cmd
+                        break
+
+        buf: list[str] = []
+        cwd = os.path.dirname(install_script)
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            buf.append(line)
+            if progress_callback is not None:
+                progress_callback(line)
+        proc.wait()
+        if proc.returncode != 0:
+            tail = "\n".join(buf[-20:]) if buf else "install-tl failed"
+            raise RuntimeError(tail)
+        return "\n".join(buf)

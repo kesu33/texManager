@@ -13,7 +13,7 @@ from gi.repository import GObject, GLib, Gio, Gtk, Adw, Pango, Gdk  # noqa: E402
 
 from . import backend  # noqa: E402
 from .detection import TexInstallation, detect  # noqa: E402
-from .dialogs import show_confirm  # noqa: E402
+from .dialogs import show_confirm, OnboardingWindow  # noqa: E402
 from .history import log_event  # noqa: E402
 from .models import PackageItem, TemplateItem  # noqa: E402
 
@@ -89,28 +89,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._populate_packages()
         self._populate_shortcuts()
         self._refresh_installation_status()
-        GLib.timeout_add(500, self._debug_listview_state)
-        # select installed row after stores are populated
         self._select_package_drawer_row("Installed")
 
-    def _debug_listview_state(self):
-        if hasattr(self, 'packages_list') and self.packages_list is not None:
-            model = self.packages_list.get_model()
-            n_items = model.get_n_items() if model else 0
-            print(f"DEBUG _debug_listview_state n_items={n_items}")
-            if n_items > 0:
-                item = model.get_item(0)
-                print(f"DEBUG first item name={item.name if item else 'None'}")
-            alloc = self.packages_list.get_allocation()
-            print(f"DEBUG listview allocation width={alloc.width} height={alloc.height}")
-            parent = self.packages_list.get_parent()
-            print(f"DEBUG listview parent={parent}")
-            if parent:
-                parent_alloc = parent.get_allocation()
-                print(f"DEBUG parent allocation width={parent_alloc.width} height={parent_alloc.height}")
-        return False
-
-    # ------------------------------------------------------------------ UI
     def _apply_styles(self):
         css = """
         .package-row {
@@ -126,6 +106,22 @@ class MainWindow(Adw.ApplicationWindow):
         .package-sub {
             font-size: 0.85em;
         }
+        .tab-bar {
+            padding: 4px 8px;
+            spacing: 4px;
+        }
+        .tab-bar > togglebutton,
+        .tab-bar > button {
+            padding: 6px 16px;
+            border-radius: 8px 8px 0px 0px;
+            margin-bottom: -1px;
+            font-weight: 500;
+        }
+        .tab-bar > togglebutton:checked,
+        .tab-bar > button:checked {
+            background-color: @accent_bg_color;
+            color: @accent_fg_color;
+        }
         """
         provider = Gtk.CssProvider()
         provider.load_from_string(css)
@@ -138,13 +134,15 @@ class MainWindow(Adw.ApplicationWindow):
         toolbar = Adw.ToolbarView()
 
         header = Adw.HeaderBar()
-        switcher_title = Adw.ViewSwitcherTitle(title="TeXManager",
-                                               subtitle="TeX Live Manager")
-        header.set_title_widget(switcher_title)
-
-        switcher = Adw.ViewSwitcher(stack=switcher_title.get_stack(),
-                                    policy=Adw.ViewSwitcherPolicy.WIDE)
-        header.pack_start(switcher)
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        title_lbl = Gtk.Label(label="TeXManager")
+        title_lbl.add_css_class("title")
+        subtitle_lbl = Gtk.Label(label="TeX Live Manager")
+        subtitle_lbl.add_css_class("subtitle")
+        subtitle_lbl.add_css_class("dim-label")
+        title_box.append(title_lbl)
+        title_box.append(subtitle_lbl)
+        header.set_title_widget(title_box)
 
         menu = Gio.Menu()
         menu.append("Preferences", "app.preferences")
@@ -158,13 +156,51 @@ class MainWindow(Adw.ApplicationWindow):
         toolbar.add_top_bar(header)
 
         stack = Adw.ViewStack(vexpand=True)
-        switcher_title.set_stack(stack)
-        toolbar.set_content(stack)
+
+        tab_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        tab_bar.add_css_class("tab-bar")
+        tab_buttons: list[Gtk.ToggleButton] = []
+        tab_map: dict[str, Gtk.ToggleButton] = {}
+
+        def on_tab_clicked(btn, name):
+            stack.set_visible_child_name(name)
+
+        def on_stack_page_changed(s, p):
+            vcn = stack.get_visible_child_name()
+            for name, btn in tab_map.items():
+                btn.set_active(name == vcn)
+
+        def add_tab(name, label, icon):
+            btn = Gtk.ToggleButton(label=label)
+            btn.set_icon_name(icon)
+            btn.add_css_class("tab-button")
+            btn.connect("clicked", on_tab_clicked, name)
+            tab_bar.append(btn)
+            tab_buttons.append(btn)
+            tab_map[name] = btn
+
+        stack.connect("notify::visible-child", on_stack_page_changed)
+
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content_box.append(tab_bar)
+        content_box.append(stack)
+        toolbar.set_content(content_box)
 
         self._build_overview(stack)
         self._build_packages(stack)
         self._build_compile_watch(stack)
         self._build_utilities(stack)
+        for name, label, icon in [
+            ("overview", "Overview", "go-home-symbolic"),
+            ("packages", "Packages", "system-software-install-symbolic"),
+            ("compile", "Compile & Watch", "media-playback-start-symbolic"),
+            ("utilities", "Utilities", "preferences-system-symbolic"),
+        ]:
+            add_tab(name, label, icon)
+
+        # select the first tab
+        if tab_buttons:
+            tab_buttons[0].set_active(True)
 
         self.set_content(toolbar)
 
@@ -408,35 +444,34 @@ class MainWindow(Adw.ApplicationWindow):
         header_vbox.append(title_lbl)
         header_vbox.append(subtitle_lbl)
         header_box.append(header_vbox)
+
+        self._texlive_sort_btn = Gtk.Button(
+            icon_name="view-sort-descending-symbolic",
+            tooltip_text="Sort by year")
+        self._texlive_sort_btn.connect("clicked", self._on_texlive_sort_clicked)
+        header_box.append(self._texlive_sort_btn)
+
         vbox.append(header_box)
 
-        installed_group = Adw.PreferencesGroup(title="Installed")
-        self._texlive_installed_listbox = Gtk.ListBox(
+        versions_group = Adw.PreferencesGroup(title="TeX Live Versions")
+        self._texlive_listbox = Gtk.ListBox(
             css_classes=["boxed-list"],
             selection_mode=Gtk.SelectionMode.NONE)
-        installed_group.add(self._texlive_installed_listbox)
-
-        available_group = Adw.PreferencesGroup(title="Available")
-        self._texlive_available_listbox = Gtk.ListBox(
-            css_classes=["boxed-list"],
-            selection_mode=Gtk.SelectionMode.NONE)
-        self._texlive_available_subtitle = Gtk.Label(
-            label="Loading available versions…",
+        self._texlive_subtitle = Gtk.Label(
+            label="Loading versions…",
             css_classes=["dim-label"], xalign=0, margin_top=6)
-        available_group.add(self._texlive_available_listbox)
-        available_group.add(self._texlive_available_subtitle)
+        versions_group.add(self._texlive_listbox)
+        versions_group.add(self._texlive_subtitle)
 
-        vbox.append(installed_group)
-        vbox.append(available_group)
+        vbox.append(versions_group)
 
-        self._texlive_subtitle = subtitle_lbl
-        self._refresh_texlive_installed()
-        self._refresh_texlive_available()
+        self._texlive_sort_mode = "year"
+        self._refresh_texlive_list()
 
         return vbox
 
-    def _refresh_texlive_installed(self):
-        listbox = getattr(self, "_texlive_installed_listbox", None)
+    def _refresh_texlive_list(self):
+        listbox = getattr(self, "_texlive_listbox", None)
         if listbox is None:
             return
         child = listbox.get_first_child()
@@ -448,56 +483,55 @@ class MainWindow(Adw.ApplicationWindow):
         installs = self._installations
         primary = self._primary
         multi = len(installs) > 1
+        installed_years = {i.year for i in installs if i.year}
 
-        for inst in installs:
-            is_primary = (primary is not None
-                          and primary.bin_dir == inst.bin_dir)
-            if is_primary:
-                tag = "Primary"
-            elif multi:
-                tag = "Detected"
-            else:
-                tag = "Active"
+        if self._texlive_sort_mode == "installed":
+            for inst in installs:
+                is_primary = (primary is not None
+                              and primary.bin_dir == inst.bin_dir)
+                if is_primary:
+                    tag = "Primary"
+                elif multi:
+                    tag = "Detected"
+                else:
+                    tag = "Active"
 
-            row = Adw.ExpanderRow(
-                title=inst.label,
-                subtitle=f"{tag} — {inst.root}")
-            row.add_row(Adw.ActionRow(title="Bin directory",
-                                      subtitle=inst.bin_dir))
-            row.add_row(Adw.ActionRow(
-                title="Version",
-                subtitle=f"TeX Live {inst.year}" if inst.year else "unknown"))
-            row.add_row(Adw.ActionRow(title="Source",
-                                      subtitle=inst.source))
-            row.add_row(Adw.ActionRow(
-                title="tlmgr",
-                subtitle="yes" if inst.has_tlmgr else "no"))
-            row.add_row(Adw.ActionRow(
-                title="Functional",
-                subtitle="yes" if inst.functional else "no (broken)"))
-            row.add_row(Adw.ActionRow(
-                title="Engines",
-                subtitle=", ".join(inst.engines) or "none"))
-            listbox.append(row)
-
-        if not installs:
-            empty_row = Adw.ActionRow(
-                title="No TeX Live installations detected",
-                subtitle="Install TeX Live to get started")
-            listbox.append(empty_row)
-
-    def _refresh_texlive_available(self):
-        listbox = getattr(self, "_texlive_available_listbox", None)
-        if listbox is None:
-            return
+                row = Adw.ExpanderRow(
+                    title=inst.label,
+                    subtitle=f"{tag} — {inst.root}")
+                row.add_row(Adw.ActionRow(title="Bin directory",
+                                          subtitle=inst.bin_dir))
+                row.add_row(Adw.ActionRow(
+                    title="Version",
+                    subtitle=f"TeX Live {inst.year}" if inst.year else "unknown"))
+                row.add_row(Adw.ActionRow(title="Source",
+                                          subtitle=inst.source))
+                row.add_row(Adw.ActionRow(
+                    title="tlmgr",
+                    subtitle="yes" if inst.has_tlmgr else "no"))
+                row.add_row(Adw.ActionRow(
+                    title="Functional",
+                    subtitle="yes" if inst.functional else "no (broken)"))
+                row.add_row(Adw.ActionRow(
+                    title="Engines",
+                    subtitle=", ".join(inst.engines) or "none"))
+                uninstall_btn = Gtk.Button(
+                    label="Uninstall",
+                    css_classes=["destructive-action"],
+                    tooltip_text=f"Remove {inst.label}")
+                uninstall_btn.connect(
+                    "clicked",
+                    lambda *_b, i=inst: self._confirm_uninstall_texlive(i))
+                row.add_suffix(uninstall_btn)
+                listbox.append(row)
 
         def worker():
             years = backend.fetch_available_texlive_years()
-            GLib.idle_add(self._finish_refresh_texlive_available, years)
+            GLib.idle_add(self._finish_refresh_texlive_list, years, installed_years)
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_refresh_texlive_available(self, years):
-        listbox = getattr(self, "_texlive_available_listbox", None)
+    def _finish_refresh_texlive_list(self, years, installed_years):
+        listbox = getattr(self, "_texlive_listbox", None)
         if listbox is None:
             return False
         child = listbox.get_first_child()
@@ -506,14 +540,57 @@ class MainWindow(Adw.ApplicationWindow):
             listbox.remove(child)
             child = next_child
 
-        installed_years = {i.year for i in self._installations if i.year}
+        installs = self._installations
+        primary = self._primary
+        multi = len(installs) > 1
 
-        for year in years:
-            row = Adw.ActionRow(
-                title=f"TeX Live {year}",
-                subtitle="Available for download" if year not in installed_years
-                         else "Already installed")
-            if year not in installed_years:
+        all_years = sorted(set(years) | installed_years, reverse=True)
+        rows = []
+
+        for year in all_years:
+            inst_match = next((i for i in installs if i.year == year), None)
+            if inst_match:
+                is_primary = (primary is not None
+                              and primary.bin_dir == inst_match.bin_dir)
+                if is_primary:
+                    tag = "Primary"
+                elif multi:
+                    tag = "Detected"
+                else:
+                    tag = "Active"
+
+                row = Adw.ExpanderRow(
+                    title=inst_match.label,
+                    subtitle=f"{tag} — {inst_match.root}")
+                row.add_row(Adw.ActionRow(title="Bin directory",
+                                          subtitle=inst_match.bin_dir))
+                row.add_row(Adw.ActionRow(
+                    title="Version",
+                    subtitle=f"TeX Live {inst_match.year}" if inst_match.year else "unknown"))
+                row.add_row(Adw.ActionRow(title="Source",
+                                          subtitle=inst_match.source))
+                row.add_row(Adw.ActionRow(
+                    title="tlmgr",
+                    subtitle="yes" if inst_match.has_tlmgr else "no"))
+                row.add_row(Adw.ActionRow(
+                    title="Functional",
+                    subtitle="yes" if inst_match.functional else "no (broken)"))
+                row.add_row(Adw.ActionRow(
+                    title="Engines",
+                    subtitle=", ".join(inst_match.engines) or "none"))
+                uninstall_btn = Gtk.Button(
+                    label="Uninstall",
+                    css_classes=["destructive-action"],
+                    tooltip_text=f"Remove {inst_match.label}")
+                uninstall_btn.connect(
+                    "clicked",
+                    lambda *_b, i=inst_match: self._confirm_uninstall_texlive(i))
+                row.add_suffix(uninstall_btn)
+                rows.append(row)
+            else:
+                row = Adw.ActionRow(
+                    title=f"TeX Live {year}",
+                    subtitle="Available for download")
                 install_btn = Gtk.Button(
                     label="Install",
                     css_classes=["suggested-action"],
@@ -522,25 +599,41 @@ class MainWindow(Adw.ApplicationWindow):
                     "clicked",
                     lambda *_b, y=year: self._on_install_texlive(y))
                 row.add_suffix(install_btn)
+                rows.append(row)
+
+        if self._texlive_sort_mode == "installed":
+            installed_rows = [r for r in rows if isinstance(r, Adw.ExpanderRow)]
+            available_rows = [r for r in rows if isinstance(r, Adw.ActionRow)]
+            rows = installed_rows + available_rows
+
+        for row in rows:
             listbox.append(row)
 
-        if not years:
+        if not installs and not years:
             empty_row = Adw.ActionRow(
-                title="No available versions found",
-                subtitle="Check your network connection")
+                title="No TeX Live versions found",
+                subtitle="Install TeX Live to get started")
             listbox.append(empty_row)
 
-        if hasattr(self, "_texlive_available_subtitle") \
-                and self._texlive_available_subtitle is not None:
-            if len(years) >= 2:
-                self._texlive_available_subtitle.set_label(
-                    f"Oldest: TeX Live {years[0]} — Latest: TeX Live {years[-1]}")
-            elif years:
-                self._texlive_available_subtitle.set_label(
-                    f"Latest: TeX Live {years[-1]}")
+        if hasattr(self, "_texlive_subtitle") \
+                and self._texlive_subtitle is not None:
+            if all_years:
+                self._texlive_subtitle.set_label(
+                    f"Latest: TeX Live {all_years[0]} — Oldest: TeX Live {all_years[-1]}")
             else:
-                self._texlive_available_subtitle.set_label("No versions found")
+                self._texlive_subtitle.set_label("No versions found")
         return False
+
+    def _on_texlive_sort_clicked(self, *args):
+        if self._texlive_sort_mode == "year":
+            self._texlive_sort_mode = "installed"
+            self._texlive_sort_btn.set_icon_name("view-sort-ascending-symbolic")
+            self._texlive_sort_btn.set_tooltip_text("Sort by installed")
+        else:
+            self._texlive_sort_mode = "year"
+            self._texlive_sort_btn.set_icon_name("view-sort-descending-symbolic")
+            self._texlive_sort_btn.set_tooltip_text("Sort by year")
+        self._refresh_texlive_list()
 
     def _on_drawer_row_selected(self, listbox, row):
         if row is None:
@@ -890,7 +983,6 @@ class MainWindow(Adw.ApplicationWindow):
             row = self._drawer_categories_row
         elif title == "TeX Live":
             row = self._drawer_texlive_row
-        print(f"DEBUG _select_package_drawer_row title={title!r} row={row}")
         if row is not None and self._package_drawer is not None:
             self._package_drawer.select_row(row)
 
@@ -1074,8 +1166,7 @@ class MainWindow(Adw.ApplicationWindow):
     # ---- installation detection (backend) ----
     def _refresh_installation_status(self):
         self._primary, self._installations, conflict = detect()
-        self._refresh_texlive_installed()
-        self._refresh_texlive_available()
+        self._refresh_texlive_list()
         if self._primary is None:
             self.status_row.set_subtitle("No installation detected")
             self.status_icon.set_from_icon_name("dialog-warning-symbolic")
@@ -1224,8 +1315,12 @@ class MainWindow(Adw.ApplicationWindow):
             lambda: self._uninstall_installation(inst, details_dialog),
         )
 
+    def _confirm_uninstall_texlive(self, inst):
+        self._confirm_uninstall(inst, self)
+
     def _uninstall_installation(self, inst, details_dialog):
-        details_dialog.close()
+        if details_dialog is not None and details_dialog is not self:
+            details_dialog.close()
 
         processing = Adw.AlertDialog(heading="Uninstalling…",
                                       body=f"Removing {inst.label}…")
@@ -1398,8 +1493,19 @@ class MainWindow(Adw.ApplicationWindow):
         pass
 
     def _on_install_texlive(self, year: int):
-        url = "https://www.tug.org/texlive/"
-        Gtk.show_uri(self, url, GLib.get_current_time())
+        wizard = OnboardingWindow(transient_for=self, year=year)
+        wizard.present()
+
+    def _on_texlive_sort_clicked(self, *args):
+        if self._texlive_sort_mode == "year":
+            self._texlive_sort_mode = "installed"
+            self._texlive_sort_btn.set_icon_name("view-sort-ascending-symbolic")
+            self._texlive_sort_btn.set_tooltip_text("Sort by installed")
+        else:
+            self._texlive_sort_mode = "year"
+            self._texlive_sort_btn.set_icon_name("view-sort-descending-symbolic")
+            self._texlive_sort_btn.set_tooltip_text("Sort by year")
+        self._refresh_texlive_list()
 
     def on_validate_bib(self, *args):  # E.2
         pass
