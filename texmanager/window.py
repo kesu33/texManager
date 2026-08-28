@@ -83,6 +83,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._installations: list[TexInstallation] = []
         self._conflict_radios: list = []
         self._selected_package: str | None = None
+        self._updates_loaded: bool = False
 
         self._build_ui()
         self._populate_packages()
@@ -311,6 +312,15 @@ class MainWindow(Adw.ApplicationWindow):
         cheader.pack_end(search)
         cheader.pack_end(self._packages_status)
         cheader.pack_end(self._packages_spinner)
+
+        show_updates = Gtk.Button(label="Update",
+                                   icon_name="software-update-available-symbolic",
+                                   css_classes=["suggested-action"],
+                                   tooltip_text="Show packages with updates "
+                                                "available")
+        show_updates.connect("clicked", self._on_show_updates)
+        cheader.pack_start(show_updates)
+
         list_toolbar.add_top_bar(cheader)
 
         scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
@@ -373,6 +383,8 @@ class MainWindow(Adw.ApplicationWindow):
             self._current_fmodel = self._installed_fmodel
         elif title == "Updates":
             self._current_fmodel = self._updates_fmodel
+            if not self._updates_loaded:
+                self._load_updates_packages()
         else:
             self._current_fmodel = self._categories_fmodel
         self._set_package_model(self._current_fmodel)
@@ -417,7 +429,7 @@ class MainWindow(Adw.ApplicationWindow):
         listitem._pkg_name = name
         listitem._pkg_sub = sub
         listitem._pkg_btn = btn
-        btn.connect("clicked", lambda *_: self._on_row_uninstall_clicked(listitem))
+        btn.connect("clicked", lambda *_: self._on_row_action_clicked(listitem))
 
     def _pkg_row_bind(self, factory, listitem):
         item = listitem.get_item()
@@ -425,14 +437,30 @@ class MainWindow(Adw.ApplicationWindow):
             return
         listitem._pkg_name.set_label(item.name)
         listitem._pkg_sub.set_label(item.category or "")
-        listitem._pkg_btn.set_visible(item.installed)
-        listitem._pkg_btn.set_sensitive(item.installed)
+        if item.update_available:
+            # Updates view: show an Update button (no Uninstall)
+            btn = listitem._pkg_btn
+            btn.set_icon_name("software-update-available-symbolic")
+            btn.set_css_classes(["suggested-action", "flat"])
+            btn.set_tooltip_text("Update this package")
+            btn.set_visible(True)
+            btn.set_sensitive(True)
+        else:
+            btn = listitem._pkg_btn
+            btn.set_icon_name("user-trash-symbolic")
+            btn.set_css_classes(["destructive-action", "flat"])
+            btn.set_tooltip_text("Uninstall this package")
+            btn.set_visible(item.installed)
+            btn.set_sensitive(item.installed)
 
-    def _on_row_uninstall_clicked(self, listitem):
+    def _on_row_action_clicked(self, listitem):
         item = listitem.get_item()
         if item is None:
             return
-        self._confirm_uninstall_package(item.name)
+        if item.update_available:
+            self._confirm_update_package(item.name)
+        else:
+            self._confirm_uninstall_package(item.name)
 
     def _confirm_uninstall_package(self, name):
         show_confirm(
@@ -442,6 +470,57 @@ class MainWindow(Adw.ApplicationWindow):
              "This action cannot be undone."],
             lambda: self._uninstall_package(name),
         )
+
+    def _confirm_update_package(self, name):
+        show_confirm(
+            self, "Update package?",
+            f"Update {name}?",
+            [f"This updates {name} to the latest version via tlmgr."],
+            lambda: self._update_package(name),
+        )
+
+    def _update_package(self, name):
+        processing = Adw.AlertDialog(heading="Updating…",
+                                     body=f"Updating {name}…")
+        spinner = Gtk.Spinner(spinning=True)
+        spinner.set_margin_top(12)
+        processing.set_extra_child(spinner)
+        processing.present(self)
+
+        def worker():
+            error = None
+            try:
+                backend.update_package(name)
+            except Exception as exc:
+                error = str(exc)
+                print(f"[DEBUG] _update_package({name}) EXCEPTION:\n{error}",
+                      flush=True)
+            log_event("_update_package", name,
+                      "ok" if error is None else f"ERROR: {error}")
+            GLib.idle_add(self._finish_update_package, name, processing, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_update_package(self, name, processing, error):
+        processing.close()
+        if error:
+            print(f"[DEBUG] _finish_update_package({name}) FAILED:\n{error}",
+                  flush=True)
+            dialog = Adw.AlertDialog(heading="Update failed",
+                                     body=self._privilege_hint(error))
+        else:
+            # no longer in the "updates available" list
+            store = self._updates_store
+            for i in range(store.get_n_items()):
+                if store.get_item(i).name == name:
+                    store.remove(i)
+                    break
+            dialog = Adw.AlertDialog(heading="Updated",
+                                     body=f"{name} was updated.")
+        dialog.add_response("ok", "OK")
+        dialog.set_default_response("ok")
+        dialog.present(self)
+        return False
 
     def _set_package_model(self, fmodel):
         """Wrap a filter model in a SingleSelection and track selection."""
@@ -581,6 +660,8 @@ class MainWindow(Adw.ApplicationWindow):
                 backend.uninstall_package(name)
             except Exception as exc:
                 error = str(exc)
+                print(f"[DEBUG] _uninstall_package({name}) EXCEPTION:\n{error}",
+                      flush=True)
             log_event("_uninstall_package", name,
                       "ok" if error is None else f"ERROR: {error}")
             GLib.idle_add(self._finish_uninstall_package, name, processing, error)
@@ -590,6 +671,8 @@ class MainWindow(Adw.ApplicationWindow):
     def _finish_uninstall_package(self, name, processing, error):
         processing.close()
         if error:
+            print(f"[DEBUG] _finish_uninstall_package({name}) FAILED:\n{error}",
+                  flush=True)
             dialog = Adw.AlertDialog(heading="Uninstall failed", body=error)
         else:
             # remove the package from every store that contains it
@@ -618,6 +701,10 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_package_search(self, entry):
         self._name_filter.set_search(entry.get_text())
+
+    def _on_show_updates(self, *args):
+        # jump to the Updates view, which loads the updatable-package list
+        self._package_drawer.select_row(self._drawer_updates_row)
 
     def _select_package_drawer_row(self, title):
         row = None
@@ -732,15 +819,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     # ---- package data ----
     def _populate_packages(self):
-        # updates available (sample)
-        for name, category in [
-            ("latex-base", "Core"),
-            ("graphicx", "Graphics"),
-            ("pgf", "Graphics"),
-        ]:
-            self._updates_store.append(PackageItem(name, installed=True,
-                                                   category=category))
-
         # categories / available (sample)
         for name, category in [
             ("beamer", "Presentation"),
@@ -755,7 +833,8 @@ class MainWindow(Adw.ApplicationWindow):
             self._categories_store.append(PackageItem(name, installed=False,
                                                        category=category))
 
-        # the Installed view is filled from the real TeX Live install
+        # the Installed view is filled from the real TeX Live install;
+        # the Updates view is filled lazily when its drawer row is selected
         self._set_package_model(self._installed_fmodel)
         self._load_installed_packages()
 
@@ -778,6 +857,29 @@ class MainWindow(Adw.ApplicationWindow):
         self._packages_spinner.stop()
         self._packages_status.set_label(f"{len(names)} installed")
         log_event("package-list", "installed", f"count={len(names)}")
+        return False
+
+    def _load_updates_packages(self):
+        """Load packages with available updates off the UI thread."""
+        self._packages_spinner.start()
+        self._packages_status.set_label("Loading updates…")
+
+        def worker():
+            names = backend.list_updatable_packages()
+            GLib.idle_add(self._finish_load_updates, names)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_load_updates(self, names):
+        self._updates_store.remove_all()
+        for name in names:
+            self._updates_store.append(PackageItem(
+                name, installed=True, category="TeX Live",
+                update_available=True))
+        self._packages_spinner.stop()
+        self._packages_status.set_label(f"{len(names)} updates available")
+        self._updates_loaded = True
+        log_event("package-list", "updates", f"count={len(names)}")
         return False
 
     def _populate_shortcuts(self):

@@ -15,12 +15,15 @@ class PackageItem(GObject.Object):
     installed = GObject.Property(type=bool, default=True)
     selected = GObject.Property(type=bool, default=False)
     category = GObject.Property(type=str, default="")
+    update_available = GObject.Property(type=bool, default=False)
 
-    def __init__(self, name: str, installed: bool = True, category: str = ""):
+    def __init__(self, name: str, installed: bool = True, category: str = "",
+                 update_available: bool = False):
         super().__init__()
         self.name = name
         self.installed = installed
         self.category = category
+        self.update_available = update_available
 
 
 class TemplateItem(GObject.Object):

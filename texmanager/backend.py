@@ -141,21 +141,76 @@ def _parse_tlmgr_info(text: str, info: dict) -> None:
             info["files"].append(path)
 
 
+def _escalate(cmd: list[str], tlmgr: str) -> list[str]:
+    """Prefix ``cmd`` with an elevation tool when the install isn't writable.
+
+    Prefers ``pkexec`` (the graphical standard for GUI apps); falls back to
+    ``sudo``. If neither is available the command is returned unchanged and will
+    fail with a clear permission error from ``tlmgr``.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.dirname(tlmgr)))
+    if os.access(root, os.W_OK):
+        return cmd
+    for elev in ("pkexec", "sudo"):
+        if shutil.which(elev):
+            return [elev] + cmd
+    return cmd
+
+
 def uninstall_package(name: str, tlmgr: str | None = None) -> str:
     """Remove an installed package via ``tlmgr remove``.
 
-    Uses ``pkexec`` automatically when the install root is not writable by the
-    current user (system-wide TeX Live). Raises ``RuntimeError`` on failure.
+    Elevates with ``pkexec``/``sudo`` when the install root is not writable by
+    the current user (system-wide TeX Live). Raises ``RuntimeError`` on failure.
     """
     tlmgr = tlmgr or find_tlmgr()
     if not tlmgr:
         raise RuntimeError("tlmgr not found; cannot uninstall packages")
-    root = os.path.dirname(os.path.dirname(os.path.dirname(tlmgr)))
-    cmd = [tlmgr, "remove", "--force", name]
-    if not os.access(root, os.W_OK) and shutil.which("pkexec"):
-        cmd = ["pkexec"] + cmd
+    cmd = _escalate([tlmgr, "remove", "--force", name], tlmgr)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip()
                            or "tlmgr remove failed")
+    return result.stdout
+
+
+def list_updatable_packages(tlmgr: str | None = None) -> list[str]:
+    """Return the sorted names of installed packages that have updates.
+
+    Parses ``tlmgr update --list`` (a dry run that contacts the repository but
+    does not change anything). Lines of the form ``update: <pkg> ...`` are the
+    packages with a newer version available.
+    """
+    tlmgr = tlmgr or find_tlmgr()
+    if not tlmgr:
+        return []
+    try:
+        out = subprocess.run([tlmgr, "update", "--list"],
+                             capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    names: list[str] = []
+    for line in out.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("update:"):
+            rest = s[len("update:"):].strip()
+            if rest:
+                names.append(rest.split()[0])
+    return sorted(names)
+
+
+def update_package(name: str, tlmgr: str | None = None) -> str:
+    """Update a single installed package via ``tlmgr update``.
+
+    Elevates with ``pkexec``/``sudo`` when the install root is not writable by
+    the current user (system-wide TeX Live). Raises ``RuntimeError`` on failure.
+    """
+    tlmgr = tlmgr or find_tlmgr()
+    if not tlmgr:
+        raise RuntimeError("tlmgr not found; cannot update packages")
+    cmd = _escalate([tlmgr, "update", name], tlmgr)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip()
+                           or "tlmgr update failed")
     return result.stdout
