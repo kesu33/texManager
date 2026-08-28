@@ -21,7 +21,10 @@ def main():
             )
             return 1
         raise
-    return TexManagerApplication().run(sys.argv)
+    try:
+        return TexManagerApplication().run(sys.argv)
+    except KeyboardInterrupt:
+        return 0
 
 
 if __name__ == "__main__":

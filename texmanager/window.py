@@ -261,15 +261,20 @@ class MainWindow(Adw.ApplicationWindow):
         categories_row = Adw.ActionRow(title="Categories",
                                        subtitle="Available packages by category")
         categories_row.set_icon_name("view-grid-symbolic")
+        texlive_row = Adw.ActionRow(title="TeX Live",
+                                    subtitle="Installed versions")
+        texlive_row.set_icon_name("application-x-executable-symbolic")
 
         self._drawer_installed_row = installed_row
         self._drawer_updates_row = updates_row
         self._drawer_categories_row = categories_row
+        self._drawer_texlive_row = texlive_row
         self._package_drawer = drawer
 
         drawer.append(installed_row)
         drawer.append(updates_row)
         drawer.append(categories_row)
+        drawer.append(texlive_row)
         sidebar_box.append(drawer)
 
         # stores for each view
@@ -333,7 +338,18 @@ class MainWindow(Adw.ApplicationWindow):
         self.packages_list.set_show_separators(True)
         self.packages_list.set_size_request(400, 300)
         scroll.set_child(self.packages_list)
-        list_toolbar.set_content(scroll)
+
+        texlive_scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+        texlive_scroll.set_min_content_height(200)
+        texlive_scroll.set_min_content_width(300)
+        texlive_scroll.set_size_request(400, 300)
+        texlive_scroll.set_child(self._build_texlive_page())
+
+        self._content_stack = Gtk.Stack()
+        self._content_stack.add_named(scroll, "packages")
+        self._content_stack.add_named(texlive_scroll, "texlive")
+        self._content_stack.set_visible_child_name("packages")
+        list_toolbar.set_content(self._content_stack)
 
         self.selection_bar = Gtk.ActionBar(revealed=False, halign=Gtk.Align.FILL)
         sel_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
@@ -374,20 +390,178 @@ class MainWindow(Adw.ApplicationWindow):
         stack.add_titled(split, "packages", "Packages").set_icon_name(
             "system-software-install-symbolic")
 
+    def _build_texlive_page(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        vbox.set_margin_top(6)
+        vbox.set_margin_bottom(6)
+        vbox.set_margin_start(6)
+        vbox.set_margin_end(6)
+
+        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                             spacing=12, margin_bottom=6)
+        title_lbl = Gtk.Label(label="TeX Live Installations",
+                              css_classes=["heading"], xalign=0)
+        subtitle_lbl = Gtk.Label(label="", css_classes=["dim-label"],
+                                 xalign=0)
+        header_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                              spacing=2)
+        header_vbox.append(title_lbl)
+        header_vbox.append(subtitle_lbl)
+        header_box.append(header_vbox)
+        vbox.append(header_box)
+
+        installed_group = Adw.PreferencesGroup(title="Installed")
+        self._texlive_installed_listbox = Gtk.ListBox(
+            css_classes=["boxed-list"],
+            selection_mode=Gtk.SelectionMode.NONE)
+        installed_group.add(self._texlive_installed_listbox)
+
+        available_group = Adw.PreferencesGroup(title="Available")
+        self._texlive_available_listbox = Gtk.ListBox(
+            css_classes=["boxed-list"],
+            selection_mode=Gtk.SelectionMode.NONE)
+        self._texlive_available_subtitle = Gtk.Label(
+            label="Loading available versions…",
+            css_classes=["dim-label"], xalign=0, margin_top=6)
+        available_group.add(self._texlive_available_listbox)
+        available_group.add(self._texlive_available_subtitle)
+
+        vbox.append(installed_group)
+        vbox.append(available_group)
+
+        self._texlive_subtitle = subtitle_lbl
+        self._refresh_texlive_installed()
+        self._refresh_texlive_available()
+
+        return vbox
+
+    def _refresh_texlive_installed(self):
+        listbox = getattr(self, "_texlive_installed_listbox", None)
+        if listbox is None:
+            return
+        child = listbox.get_first_child()
+        while child:
+            next_child = child.get_next_sibling()
+            listbox.remove(child)
+            child = next_child
+
+        installs = self._installations
+        primary = self._primary
+        multi = len(installs) > 1
+
+        for inst in installs:
+            is_primary = (primary is not None
+                          and primary.bin_dir == inst.bin_dir)
+            if is_primary:
+                tag = "Primary"
+            elif multi:
+                tag = "Detected"
+            else:
+                tag = "Active"
+
+            row = Adw.ExpanderRow(
+                title=inst.label,
+                subtitle=f"{tag} — {inst.root}")
+            row.add_row(Adw.ActionRow(title="Bin directory",
+                                      subtitle=inst.bin_dir))
+            row.add_row(Adw.ActionRow(
+                title="Version",
+                subtitle=f"TeX Live {inst.year}" if inst.year else "unknown"))
+            row.add_row(Adw.ActionRow(title="Source",
+                                      subtitle=inst.source))
+            row.add_row(Adw.ActionRow(
+                title="tlmgr",
+                subtitle="yes" if inst.has_tlmgr else "no"))
+            row.add_row(Adw.ActionRow(
+                title="Functional",
+                subtitle="yes" if inst.functional else "no (broken)"))
+            row.add_row(Adw.ActionRow(
+                title="Engines",
+                subtitle=", ".join(inst.engines) or "none"))
+            listbox.append(row)
+
+        if not installs:
+            empty_row = Adw.ActionRow(
+                title="No TeX Live installations detected",
+                subtitle="Install TeX Live to get started")
+            listbox.append(empty_row)
+
+    def _refresh_texlive_available(self):
+        listbox = getattr(self, "_texlive_available_listbox", None)
+        if listbox is None:
+            return
+
+        def worker():
+            years = backend.fetch_available_texlive_years()
+            GLib.idle_add(self._finish_refresh_texlive_available, years)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_refresh_texlive_available(self, years):
+        listbox = getattr(self, "_texlive_available_listbox", None)
+        if listbox is None:
+            return False
+        child = listbox.get_first_child()
+        while child:
+            next_child = child.get_next_sibling()
+            listbox.remove(child)
+            child = next_child
+
+        installed_years = {i.year for i in self._installations if i.year}
+
+        for year in years:
+            row = Adw.ActionRow(
+                title=f"TeX Live {year}",
+                subtitle="Available for download" if year not in installed_years
+                         else "Already installed")
+            if year not in installed_years:
+                install_btn = Gtk.Button(
+                    label="Install",
+                    css_classes=["suggested-action"],
+                    tooltip_text=f"Download and install TeX Live {year}")
+                install_btn.connect(
+                    "clicked",
+                    lambda *_b, y=year: self._on_install_texlive(y))
+                row.add_suffix(install_btn)
+            listbox.append(row)
+
+        if not years:
+            empty_row = Adw.ActionRow(
+                title="No available versions found",
+                subtitle="Check your network connection")
+            listbox.append(empty_row)
+
+        if hasattr(self, "_texlive_available_subtitle") \
+                and self._texlive_available_subtitle is not None:
+            if len(years) >= 2:
+                self._texlive_available_subtitle.set_label(
+                    f"Oldest: TeX Live {years[0]} — Latest: TeX Live {years[-1]}")
+            elif years:
+                self._texlive_available_subtitle.set_label(
+                    f"Latest: TeX Live {years[-1]}")
+            else:
+                self._texlive_available_subtitle.set_label("No versions found")
+        return False
+
     def _on_drawer_row_selected(self, listbox, row):
         if row is None:
             return
         title = row.get_title()
         self.packages_title.set_label(title)
-        if title == "Installed":
+        if title == "TeX Live":
+            self._content_stack.set_visible_child_name("texlive")
+        elif title == "Installed":
+            self._content_stack.set_visible_child_name("packages")
             self._current_fmodel = self._installed_fmodel
         elif title == "Updates":
+            self._content_stack.set_visible_child_name("packages")
             self._current_fmodel = self._updates_fmodel
             if not self._updates_loaded:
                 self._load_updates_packages()
         else:
+            self._content_stack.set_visible_child_name("packages")
             self._current_fmodel = self._categories_fmodel
-        self._set_package_model(self._current_fmodel)
+        if title != "TeX Live":
+            self._set_package_model(self._current_fmodel)
 
     def _build_package_list_factory(self) -> Gtk.SignalListItemFactory:
         """Each row = package name (left) + an Uninstall button (right)."""
@@ -714,6 +888,8 @@ class MainWindow(Adw.ApplicationWindow):
             row = self._drawer_updates_row
         elif title == "Categories":
             row = self._drawer_categories_row
+        elif title == "TeX Live":
+            row = self._drawer_texlive_row
         print(f"DEBUG _select_package_drawer_row title={title!r} row={row}")
         if row is not None and self._package_drawer is not None:
             self._package_drawer.select_row(row)
@@ -898,6 +1074,8 @@ class MainWindow(Adw.ApplicationWindow):
     # ---- installation detection (backend) ----
     def _refresh_installation_status(self):
         self._primary, self._installations, conflict = detect()
+        self._refresh_texlive_installed()
+        self._refresh_texlive_available()
         if self._primary is None:
             self.status_row.set_subtitle("No installation detected")
             self.status_icon.set_from_icon_name("dialog-warning-symbolic")
@@ -1218,6 +1396,10 @@ class MainWindow(Adw.ApplicationWindow):
 
     def on_open_pdf(self, *args):  # New Tab 4
         pass
+
+    def _on_install_texlive(self, year: int):
+        url = "https://www.tug.org/texlive/"
+        Gtk.show_uri(self, url, GLib.get_current_time())
 
     def on_validate_bib(self, *args):  # E.2
         pass

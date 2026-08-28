@@ -8,7 +8,10 @@ __all__ = ["TexManagerApplication"]
 
 def main():
     app = TexManagerApplication()
-    return app.run(sys.argv)
+    try:
+        return app.run(sys.argv)
+    except KeyboardInterrupt:
+        return 0
 
 
 if __name__ == "__main__":

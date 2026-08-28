@@ -1,7 +1,8 @@
-"""Backend helpers that query TeX Live for installed packages.
+"""Backend helpers that query TeX Live for installed packages and metadata.
 
 All functions are GUI-agnostic and safe to call from a worker thread: they
-never touch GTK and only shell out to ``tlmgr`` or read the local TLPDB file.
+never touch GTK and only shell out to ``tlmgr``, read local TLPDB files, or
+fetch remote metadata over HTTPS.
 """
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 
 # tlmgr prints one package per line as:  "i <pkg> <short description>"
@@ -214,3 +216,38 @@ def update_package(name: str, tlmgr: str | None = None) -> str:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip()
                            or "tlmgr update failed")
     return result.stdout
+
+
+def fetch_available_texlive_years(timeout: int = 15) -> list[int]:
+    """Return a sorted list of available TeX Live years from TUG.
+
+    Parses the TUG homepage for the current release year and supplements
+    with known recent years from the historic archive. Falls back to a
+    short recent list when the network request fails.
+    """
+    years: list[int] = []
+    url = "https://www.tug.org/texlive/"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "TeXManager/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        for m in re.finditer(r"TeX Live (\d{4}) is available", text):
+            years.append(int(m.group(1)))
+        for m in re.finditer(r"texlive-(\d{4})\.html", text):
+            years.append(int(m.group(1)))
+    except (OSError, ValueError):
+        pass
+    if years:
+        years = sorted(set(years))
+    else:
+        from datetime import date
+        y = date.today().year
+        years = [y - 3, y - 2, y - 1, y]
+    if len(years) == 1:
+        years.extend([years[0] - 1, years[0] - 2, years[0] - 3])
+    elif len(years) == 2:
+        years.extend([years[0] - 1, years[0] - 2])
+    elif len(years) == 3:
+        years.append(years[0] - 1)
+    years = sorted(set(years))
+    return years
